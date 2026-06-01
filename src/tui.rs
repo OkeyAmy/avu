@@ -1,30 +1,119 @@
 use crate::{backend, cli::TuiArgs, domain::*, engine, hud, intent};
 use anyhow::Result;
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
 use ratatui::{
     Terminal,
-    backend::TestBackend,
+    backend::{CrosstermBackend, TestBackend},
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
+use std::{io, time::Duration};
 
 pub fn run(args: TuiArgs) -> Result<()> {
-    if !args.once {
-        eprintln!("interactive TUI loop is not enabled yet; rendering one architecture frame");
+    if args.once {
+        let state = state_for_args(&args)?;
+        let output = render_to_string(&state, 120, 36)?;
+        println!("{output}");
+        return Ok(());
     }
 
-    let state = if let Some(fixture) = args.fixture.as_ref() {
-        backend::load_fixture(fixture)?
-    } else {
-        backend::adapter_for(args.backend).cockpit_state()
-    };
+    run_interactive(args)
+}
 
-    // This first architecture milestone renders one deterministic frame. The renderer is
-    // intentionally backend-agnostic so live Hermes/OpenClaw adapters and fixtures share UI.
-    let output = render_to_string(&state, 120, 36)?;
-    println!("{output}");
+fn state_for_args(args: &TuiArgs) -> Result<CockpitState> {
+    if let Some(fixture) = args.fixture.as_ref() {
+        backend::load_fixture(fixture)
+    } else {
+        Ok(backend::adapter_for(args.backend).cockpit_state())
+    }
+}
+
+fn run_interactive(args: TuiArgs) -> Result<()> {
+    let mut terminal = TerminalSession::start()?;
+    let mut state = state_for_args(&args)?;
+    let mut tick = 0_u8;
+
+    loop {
+        engine::apply_projection(&mut state);
+        terminal.draw(|frame| render(frame, &state))?;
+
+        if event::poll(Duration::from_millis(250))?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                KeyCode::Char('s') => state = state_for_args(&args)?,
+                KeyCode::Char('i') => push_operator_event(
+                    &mut state,
+                    EventKind::Warning,
+                    "interrupt requested; backend control routing not enabled yet",
+                ),
+                KeyCode::Char('m') => push_operator_event(
+                    &mut state,
+                    EventKind::Warning,
+                    "mute requested; voice input is currently keyboard-only",
+                ),
+                _ => {}
+            }
+        }
+
+        tick = tick.wrapping_add(1);
+        if tick >= 8 {
+            state = state_for_args(&args)?;
+            tick = 0;
+        }
+    }
+
     Ok(())
+}
+
+fn push_operator_event(state: &mut CockpitState, kind: EventKind, label: &str) {
+    state.events.push(CockpitEvent {
+        at: chrono::Utc::now(),
+        kind,
+        label: label.to_string(),
+    });
+}
+
+struct TerminalSession {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+}
+
+impl TerminalSession {
+    fn start() -> Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen)?;
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.clear()?;
+        Ok(Self { terminal })
+    }
+
+    fn draw<F>(&mut self, f: F) -> io::Result<()>
+    where
+        F: FnOnce(&mut ratatui::Frame<'_>),
+    {
+        self.terminal.draw(f).map(|_| ())
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = self.terminal.show_cursor();
+    }
 }
 
 pub fn render_to_string(state: &CockpitState, width: u16, height: u16) -> Result<String> {
