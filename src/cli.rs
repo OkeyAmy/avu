@@ -24,6 +24,8 @@ pub enum Command {
     Config(ConfigArgs),
     /// Render the Avu cockpit from a live adapter or fixture.
     Tui(TuiArgs),
+    /// Show installation state, check PATH, or repair self-install.
+    Install(InstallArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -80,6 +82,19 @@ pub struct TuiArgs {
     /// Backend to inspect when no fixture is supplied.
     #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
     pub backend: BackendChoice,
+}
+
+#[derive(Debug, Args, Clone, Default)]
+pub struct InstallArgs {
+    /// Only run install checks; exit non-zero on failure.
+    #[arg(long)]
+    pub check: bool,
+    /// Copy avu binary to ~/.local/bin and print PATH repair instructions.
+    #[arg(long)]
+    pub fix_self: bool,
+    /// Emit JSON install report for automation.
+    #[arg(long)]
+    pub info: bool,
 }
 
 #[derive(

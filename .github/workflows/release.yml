@@ -1,0 +1,248 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without leading v, matching Cargo.toml and package.json
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+            tag="v${version}"
+          else
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#v}"
+          fi
+          if [ -z "${version}" ] || [ "${version}" = "${tag}" ]; then
+            echo "Release tags must look like v0.1.0" >&2
+            exit 1
+          fi
+          if ! git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "Tag ${tag} does not exist" >&2
+            exit 1
+          fi
+          git checkout "${tag}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Check package versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          cargo_version="$(grep '^version = ' Cargo.toml | head -n 1 | sed -E 's/version = "([^"]+)"/\1/')"
+          package_version="$(node -p "require('./package.json').version")"
+          if [ "${cargo_version}" != "${version}" ]; then
+            echo "Cargo.toml version ${cargo_version} does not match tag ${version}" >&2
+            exit 1
+          fi
+          if [ "${package_version}" != "${version}" ]; then
+            echo "package.json version ${package_version} does not match tag ${version}" >&2
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: avu-x86_64-unknown-linux-musl.tar.gz
+            exe: avu
+            archive-kind: tar
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            archive: avu-aarch64-unknown-linux-musl.tar.gz
+            exe: avu
+            archive-kind: tar
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: avu-x86_64-apple-darwin.tar.gz
+            exe: avu
+            archive-kind: tar
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: avu-aarch64-apple-darwin.tar.gz
+            exe: avu
+            archive-kind: tar
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: avu-x86_64-pc-windows-msvc.zip
+            exe: avu.exe
+            archive-kind: zip
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            archive: avu-aarch64-pc-windows-msvc.zip
+            exe: avu.exe
+            archive-kind: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Install Linux musl tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage Unix binary
+        if: matrix.archive-kind == 'tar'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/stage
+          cp "target/${{ matrix.target }}/release/${{ matrix.exe }}" dist/stage/avu
+          chmod +x dist/stage/avu
+          tar -czf "dist/${{ matrix.archive }}" -C dist/stage avu
+
+      - name: Stage Windows binary
+        if: matrix.archive-kind == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.exe }}" "dist/stage/avu.exe" -Force
+          Compress-Archive -Path "dist/stage/avu.exe" -DestinationPath "dist/${{ matrix.archive }}" -Force
+
+      - name: Attest release archive
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/${{ matrix.archive }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: dist/${{ matrix.archive }}
+          if-no-files-found: error
+
+  sbom:
+    name: Generate SBOM
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Create SBOM output directory
+        run: mkdir -p dist
+
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: dist/avu-${{ needs.validate.outputs.version }}.cdx.json
+          upload-artifact: false
+          dependency-snapshot: false
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: avu-${{ needs.validate.outputs.version }}.cdx.json
+          path: dist/avu-${{ needs.validate.outputs.version }}.cdx.json
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - validate
+      - build
+      - sbom
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum avu-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest SBOM for release assets
+        uses: actions/attest@v4
+        with:
+          subject-checksums: dist/SHA256SUMS
+          sbom-path: dist/avu-${{ needs.validate.outputs.version }}.cdx.json
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          cosign sign-blob --yes \
+            --output-signature SHA256SUMS.sig \
+            --output-certificate SHA256SUMS.pem \
+            SHA256SUMS
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.validate.outputs.tag }}"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" dist/* --clobber
+          else
+            gh release create "${tag}" dist/* --verify-tag --generate-notes --title "${tag}"
+          fi

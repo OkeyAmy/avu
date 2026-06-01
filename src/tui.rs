@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
 };
 
 pub fn run(args: TuiArgs) -> Result<()> {
@@ -55,54 +55,20 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &CockpitState) {
     if root.width < 100 {
         let stack = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(10),
-                Constraint::Min(12),
-                Constraint::Length(10),
-            ])
+            .constraints([Constraint::Min(14), Constraint::Length(12)])
             .split(vertical[0]);
         render_core(frame, stack[0], state);
         render_activity(frame, stack[1], state);
-        render_modules(frame, stack[2], state);
     } else {
         let main = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(24),
-                Constraint::Min(60),
-                Constraint::Length(36),
-            ])
+            .constraints([Constraint::Min(66), Constraint::Length(42)])
             .split(vertical[0]);
 
-        render_modules(frame, main[0], state);
-        render_core(frame, main[1], state);
-        render_activity(frame, main[2], state);
+        render_core(frame, main[0], state);
+        render_activity(frame, main[1], state);
     }
     render_footer(frame, vertical[1], state);
-}
-
-fn render_modules(frame: &mut ratatui::Frame<'_>, area: Rect, state: &CockpitState) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(vec![Constraint::Length(4); state.modules.len()])
-        .split(area);
-    for (module, row) in state.modules.iter().zip(rows.iter()) {
-        let color = if module.active {
-            Color::Cyan
-        } else {
-            Color::DarkGray
-        };
-        let gauge = Gauge::default()
-            .block(
-                Block::default()
-                    .title(module.name.as_str())
-                    .borders(Borders::ALL),
-            )
-            .gauge_style(Style::default().fg(color))
-            .label(format!("{}% {}", module.level, module.detail))
-            .percent(module.level.min(100) as u16);
-        frame.render_widget(gauge, *row);
-    }
 }
 
 fn render_core(frame: &mut ratatui::Frame<'_>, area: Rect, state: &CockpitState) {
@@ -120,21 +86,12 @@ fn render_core(frame: &mut ratatui::Frame<'_>, area: Rect, state: &CockpitState)
         .split(area);
 
     let metrics = Paragraph::new(Line::from(vec![
-        Span::styled("CPU ", Style::default().fg(Color::Cyan)),
-        Span::styled(
-            format!("{}%", state.cpu_percent),
-            Style::default().fg(Color::White),
-        ),
-        Span::raw("   "),
-        Span::styled("MEM ", Style::default().fg(Color::Cyan)),
-        Span::styled(
-            format!("{}%", state.memory_percent),
-            Style::default().fg(Color::White),
-        ),
+        Span::styled("BACKEND ", Style::default().fg(Color::Cyan)),
+        Span::raw(state.backend_label.clone()),
+        Span::styled("  │ MODEL ", Style::default().fg(Color::Cyan)),
+        Span::raw(state.model_label.clone()),
         Span::styled("  │ EVENTS ", Style::default().fg(Color::Cyan)),
         Span::raw(state.events.len().to_string()),
-        Span::styled("  │ BACKEND ", Style::default().fg(Color::Cyan)),
-        Span::raw(state.backend_label.clone()),
     ]))
     .alignment(Alignment::Center)
     .block(
@@ -144,17 +101,12 @@ fn render_core(frame: &mut ratatui::Frame<'_>, area: Rect, state: &CockpitState)
     );
     frame.render_widget(metrics, core_chunks[0]);
 
-    let activity = state
-        .modules
-        .iter()
-        .map(|module| module.level as u16)
-        .sum::<u16>()
-        / state.modules.len().max(1) as u16;
+    let activity = backend_activity(state);
     let hud = hud::render_hud(
         &state.mode,
         core_chunks[1].width.saturating_sub(2) as usize,
         core_chunks[1].height.saturating_sub(2) as usize,
-        activity.min(100) as u8,
+        activity.min(100),
     );
     let hud_lines: Vec<Line<'_>> = hud
         .lines
@@ -288,9 +240,9 @@ fn render_activity(frame: &mut ratatui::Frame<'_>, area: Rect, state: &CockpitSt
 
 fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &CockpitState) {
     let footer = Paragraph::new(Line::from(vec![
-        Span::styled(" AGENT: ", Style::default().fg(Color::Cyan)),
+        Span::styled(" BACKEND: ", Style::default().fg(Color::Cyan)),
         Span::raw(state.backend_label.clone()),
-        Span::styled("  │ VOICE: ", Style::default().fg(Color::Cyan)),
+        Span::styled("  │ INPUT: ", Style::default().fg(Color::Cyan)),
         Span::raw(state.voice_label.clone()),
         Span::styled("  │ MODEL: ", Style::default().fg(Color::Cyan)),
         Span::raw(state.model_label.clone()),
@@ -299,11 +251,6 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &CockpitStat
             format!("{} active", state.tools_active),
             Style::default().fg(Color::Yellow),
         ),
-        Span::styled("  │ STATE: ", Style::default().fg(Color::Cyan)),
-        Span::styled(
-            state.mode.label(),
-            Style::default().fg(mode_color(&state.mode)),
-        ),
     ]))
     .block(
         Block::default()
@@ -311,6 +258,20 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &CockpitStat
             .border_style(Style::default().fg(Color::Cyan)),
     );
     frame.render_widget(footer, area);
+}
+
+fn backend_activity(state: &CockpitState) -> u8 {
+    if state.pending_approval.is_some() {
+        return 95;
+    }
+    match state.mode {
+        CockpitMode::Disconnected => 0,
+        CockpitMode::Error => 15,
+        CockpitMode::Idle => 25,
+        CockpitMode::ToolActive | CockpitMode::Processing => 80,
+        CockpitMode::ApprovalNeeded => 95,
+        CockpitMode::Listening | CockpitMode::WakeDetected | CockpitMode::Speaking => 70,
+    }
 }
 
 fn mode_color(mode: &CockpitMode) -> Color {
@@ -335,6 +296,6 @@ mod tests {
         assert!(output.contains("AVU EVENT RADAR"));
         assert!(output.contains("APPROVAL"));
         assert!(output.contains("ACTIVITY LOG"));
-        assert!(output.contains("AGENT:"));
+        assert!(output.contains("BACKEND:"));
     }
 }

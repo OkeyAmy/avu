@@ -1,0 +1,24 @@
+{
+  "name": "@okeyamy/avu",
+  "version": "0.1.0",
+  "description": "Wake-capable terminal cockpit over Hermes/OpenClaw",
+  "license": "MIT",
+  "bin": {
+    "avu": "npm/bin/avu.js"
+  },
+  "scripts": {
+    "postinstall": "node npm/install.js"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "npm/bin/avu.js",
+    "npm/install.js",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OkeyAmy/avu.git"
+  }
+}

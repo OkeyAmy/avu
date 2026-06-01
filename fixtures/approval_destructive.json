@@ -6,8 +6,6 @@
   "model_label": "local",
   "voice_label": "LISTENING",
   "tools_active": 2,
-  "cpu_percent": 12,
-  "memory_percent": 28,
   "capabilities": {
     "backend": "fake",
     "reachable": true,
@@ -21,15 +19,6 @@
     "permission_posture": "route_approval_responses",
     "notes": ["fixture backend: safe for setup rehearsal"]
   },
-  "modules": [
-    { "name": "INPUT", "level": 85, "active": true, "detail": "mic armed" },
-    { "name": "VOICE", "level": 92, "active": true, "detail": "wake visible" },
-    { "name": "TOOLS", "level": 72, "active": true, "detail": "2 active" },
-    { "name": "NET", "level": 64, "active": true, "detail": "gateway ok" },
-    { "name": "AGENT", "level": 80, "active": true, "detail": "attached" },
-    { "name": "NLP", "level": 58, "active": true, "detail": "intent ready" },
-    { "name": "TTS", "level": 15, "active": false, "detail": "muted" }
-  ],
   "events": [
     { "at": "2026-06-01T12:00:01Z", "kind": "listening", "label": "listening" },
     { "at": "2026-06-01T12:00:02Z", "kind": "wake_word", "label": "wake_word" },

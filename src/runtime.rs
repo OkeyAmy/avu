@@ -1,7 +1,7 @@
 use crate::domain::{BackendKind, CockpitEvent, EventKind, PermissionPosture};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use std::{fs, process::Command, thread, time::Duration};
+use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reported<T> {
@@ -34,8 +34,6 @@ pub struct RuntimeSnapshot {
     pub transcript: Reported<bool>,
     pub wake_available: Reported<bool>,
     pub permission_posture: PermissionPosture,
-    pub cpu_percent: Reported<u8>,
-    pub memory_percent: Reported<u8>,
     pub log_events: Vec<CockpitEvent>,
     pub notes: Vec<String>,
 }
@@ -55,8 +53,6 @@ impl RuntimeSnapshot {
             transcript: Reported::Unavailable,
             wake_available: Reported::Unreported,
             permission_posture: PermissionPosture::ObserveOnly,
-            cpu_percent: Reported::Unreported,
-            memory_percent: Reported::Unreported,
             log_events: vec![],
             notes: vec![format!("{command} command was not found on PATH")],
         }
@@ -70,6 +66,7 @@ pub fn hermes_snapshot(command_exists: bool) -> RuntimeSnapshot {
 
     let status = command_json("hermes", &["status", "--json"]);
     let doctor = command_json("hermes", &["doctor", "--json"]);
+    let configured_model = command_text("hermes", &["config", "get", "model"]);
     let reachable = status.is_some() || doctor.is_some();
     let log_events = read_hermes_log_events();
 
@@ -77,7 +74,7 @@ pub fn hermes_snapshot(command_exists: bool) -> RuntimeSnapshot {
         backend: BackendKind::Hermes,
         backend_label: "HERMES".to_string(),
         reachable,
-        model_label: json_string(&status, &["model.name", "model"]),
+        model_label: model_from_backend(&status, configured_model.as_deref()),
         events: json_bool(&status, &["events", "capabilities.events"]),
         approvals: json_bool(&status, &["approvals", "capabilities.approvals"]),
         interrupt: json_bool(&status, &["interrupt", "capabilities.interrupt"]),
@@ -86,8 +83,6 @@ pub fn hermes_snapshot(command_exists: bool) -> RuntimeSnapshot {
         transcript: json_bool(&status, &["transcript", "capabilities.transcript"]),
         wake_available: Reported::Unreported,
         permission_posture: PermissionPosture::ObserveNotify,
-        cpu_percent: system_cpu_percent(),
-        memory_percent: system_memory_percent(),
         log_events,
         notes: vec!["Hermes command detected; events sourced from hermes logs agent".to_string()],
     }
@@ -107,7 +102,7 @@ pub fn openclaw_snapshot(command_exists: bool) -> RuntimeSnapshot {
         backend: BackendKind::OpenClaw,
         backend_label: "OPENCLAW".to_string(),
         reachable,
-        model_label: json_string(&status, &["model.name", "model"]),
+        model_label: model_from_backend(&status, None),
         events: json_bool(&gateway, &["events", "capabilities.events"]),
         approvals: json_bool(&gateway, &["approvals", "capabilities.approvals"]),
         interrupt: json_bool(&gateway, &["interrupt", "capabilities.interrupt"]),
@@ -116,8 +111,6 @@ pub fn openclaw_snapshot(command_exists: bool) -> RuntimeSnapshot {
         transcript: json_bool(&status, &["transcript", "capabilities.transcript"]),
         wake_available: Reported::Unreported,
         permission_posture: PermissionPosture::ObserveNotify,
-        cpu_percent: system_cpu_percent(),
-        memory_percent: system_memory_percent(),
         log_events,
         notes: vec![
             "OpenClaw command detected; events sourced from openclaw logs --json".to_string(),
@@ -327,76 +320,26 @@ fn parse_openclaw_log_json(json: &Value) -> Option<CockpitEvent> {
     Some(CockpitEvent { at, kind, label })
 }
 
-pub fn parse_memory_percent(input: &str) -> Option<u8> {
-    let mut total = None;
-    let mut available = None;
-    for line in input.lines() {
-        let mut parts = line.split_whitespace();
-        match parts.next()? {
-            "MemTotal:" => total = parts.next()?.parse::<u64>().ok(),
-            "MemAvailable:" => available = parts.next()?.parse::<u64>().ok(),
-            _ => {}
-        }
-    }
-    let total = total?;
-    let available = available?;
-    if total == 0 || available > total {
-        return None;
-    }
-    Some((((total - available) * 100) / total).min(100) as u8)
-}
-
-pub fn parse_cpu_percent(first: &str, second: &str) -> Option<u8> {
-    fn totals(input: &str) -> Option<(u64, u64)> {
-        let values: Vec<u64> = input
-            .lines()
-            .next()?
-            .strip_prefix("cpu ")?
-            .split_whitespace()
-            .map(str::parse)
-            .collect::<Result<_, _>>()
-            .ok()?;
-        let idle = *values.get(3)? + values.get(4).copied().unwrap_or(0);
-        let total = values.iter().sum();
-        Some((idle, total))
-    }
-
-    let (idle_a, total_a) = totals(first)?;
-    let (idle_b, total_b) = totals(second)?;
-    let total_delta = total_b.checked_sub(total_a)?;
-    let idle_delta = idle_b.checked_sub(idle_a)?;
-    if total_delta == 0 || idle_delta > total_delta {
-        return None;
-    }
-    Some((((total_delta - idle_delta) * 100) / total_delta).min(100) as u8)
-}
-
-pub fn system_cpu_percent() -> Reported<u8> {
-    let first = match fs::read_to_string("/proc/stat") {
-        Ok(value) => value,
-        Err(_) => return Reported::Unreported,
-    };
-    thread::sleep(Duration::from_millis(60));
-    let second = match fs::read_to_string("/proc/stat") {
-        Ok(value) => value,
-        Err(_) => return Reported::Unreported,
-    };
-    parse_cpu_percent(&first, &second).map_or(Reported::Unreported, Reported::Value)
-}
-
-pub fn system_memory_percent() -> Reported<u8> {
-    fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|input| parse_memory_percent(&input))
-        .map_or(Reported::Unreported, Reported::Value)
-}
-
 pub fn command_json(command: &str, args: &[&str]) -> Option<Value> {
     let output = Command::new(command).args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
     serde_json::from_slice(&output.stdout).ok()
+}
+
+pub fn command_text(command: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(command).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn json_bool(json: &Option<Value>, paths: &[&str]) -> Reported<bool> {
@@ -423,28 +366,56 @@ fn json_string(json: &Option<Value>, paths: &[&str]) -> Reported<String> {
     Reported::Unreported
 }
 
+fn model_from_backend(status: &Option<Value>, config_model: Option<&str>) -> Reported<String> {
+    let from_status = json_string(
+        status,
+        &[
+            "model.name",
+            "model.model",
+            "model.id",
+            "model",
+            "models.active.name",
+            "models.active.model",
+            "models.default.name",
+            "models.default.model",
+            "provider.model",
+            "routing.model",
+        ],
+    );
+    if !matches!(from_status, Reported::Unreported) {
+        return from_status;
+    }
+    config_model
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| Reported::Value(value.trim().to_string()))
+        .unwrap_or(Reported::Unreported)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parses_meminfo_percent_from_linux_proc_text() {
-        let input = "MemTotal:       1000 kB\nMemAvailable:    250 kB\n";
-        assert_eq!(parse_memory_percent(input), Some(75));
-    }
-
-    #[test]
-    fn parses_cpu_percent_from_two_proc_stat_samples() {
-        let first = "cpu  100 0 100 800 0 0 0 0 0 0\n";
-        let second = "cpu  150 0 150 900 0 0 0 0 0 0\n";
-        assert_eq!(parse_cpu_percent(first, second), Some(50));
-    }
-
-    #[test]
     fn missing_metric_stays_unreported() {
         let snapshot = RuntimeSnapshot::missing("hermes");
-        assert_eq!(snapshot.cpu_percent, Reported::Unreported);
         assert_eq!(snapshot.model_label, Reported::Unreported);
+    }
+
+    #[test]
+    fn model_comes_from_backend_status_before_config_fallback() {
+        let status = Some(serde_json::json!({ "model": { "model": "gpt-5.4" } }));
+        assert_eq!(
+            model_from_backend(&status, Some("fallback-model")),
+            Reported::Value("gpt-5.4".to_string())
+        );
+    }
+
+    #[test]
+    fn model_can_fall_back_to_backend_config_command() {
+        assert_eq!(
+            model_from_backend(&None, Some("claude-sonnet")),
+            Reported::Value("claude-sonnet".to_string())
+        );
     }
 
     #[test]

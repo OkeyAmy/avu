@@ -170,14 +170,6 @@ impl CockpitEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ModuleStatus {
-    pub name: String,
-    pub level: u8,
-    pub active: bool,
-    pub detail: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CockpitState {
     pub app_name: String,
     pub mode: CockpitMode,
@@ -186,10 +178,7 @@ pub struct CockpitState {
     pub model_label: String,
     pub voice_label: String,
     pub tools_active: u16,
-    pub cpu_percent: u8,
-    pub memory_percent: u8,
     pub capabilities: CapabilitySnapshot,
-    pub modules: Vec<ModuleStatus>,
     pub events: Vec<CockpitEvent>,
     pub pending_approval: Option<ApprovalRequest>,
 }
@@ -213,10 +202,7 @@ impl CockpitState {
             model_label: "local".to_string(),
             voice_label: "LISTENING".to_string(),
             tools_active: 2,
-            cpu_percent: 12,
-            memory_percent: 28,
             capabilities: CapabilitySnapshot::fake(),
-            modules: default_modules(),
             events: vec![
                 CockpitEvent::now(EventKind::Listening, "listening"),
                 CockpitEvent::now(EventKind::WakeWord, "wake_word"),
@@ -270,90 +256,10 @@ impl CockpitState {
                 "unreported",
             ),
             tools_active: 0,
-            cpu_percent: reported_u8(snapshot.cpu_percent.clone()),
-            memory_percent: reported_u8(snapshot.memory_percent.clone()),
             capabilities,
-            modules: modules_for_runtime(&snapshot),
             events,
             pending_approval: None,
         }
-    }
-}
-
-pub fn default_modules() -> Vec<ModuleStatus> {
-    [
-        ("INPUT", 85, true, "mic armed"),
-        ("VOICE", 92, true, "wake visible"),
-        ("TOOLS", 72, true, "2 active"),
-        ("NET", 64, true, "gateway ok"),
-        ("AGENT", 80, true, "attached"),
-        ("NLP", 58, true, "intent ready"),
-        ("TTS", 15, false, "muted"),
-    ]
-    .into_iter()
-    .map(|(name, level, active, detail)| ModuleStatus {
-        name: name.to_string(),
-        level,
-        active,
-        detail: detail.to_string(),
-    })
-    .collect()
-}
-
-fn modules_for_runtime(snapshot: &RuntimeSnapshot) -> Vec<ModuleStatus> {
-    vec![
-        runtime_module(
-            "INPUT",
-            bool_level(&snapshot.wake_available),
-            detail_bool(&snapshot.wake_available, "wake input", "keyboard only"),
-        ),
-        runtime_module(
-            "VOICE",
-            bool_level(&snapshot.wake_available),
-            detail_bool(&snapshot.wake_available, "wake available", "wake disabled"),
-        ),
-        runtime_module(
-            "TOOLS",
-            bool_level(&snapshot.events),
-            detail_bool(&snapshot.events, "events reported", "events disabled"),
-        ),
-        runtime_module(
-            "NET",
-            if snapshot.reachable { 100 } else { 0 },
-            if snapshot.reachable {
-                "reachable"
-            } else {
-                "unreachable"
-            },
-        ),
-        runtime_module(
-            "AGENT",
-            bool_level(&snapshot.sessions_list),
-            detail_bool(
-                &snapshot.sessions_list,
-                "sessions reported",
-                "sessions unavailable",
-            ),
-        ),
-        runtime_module(
-            "NLP",
-            bool_level(&snapshot.transcript),
-            detail_bool(
-                &snapshot.transcript,
-                "transcript reported",
-                "transcript unavailable",
-            ),
-        ),
-        runtime_module("TTS", 0, "unreported"),
-    ]
-}
-
-fn runtime_module(name: &str, level: u8, detail: &str) -> ModuleStatus {
-    ModuleStatus {
-        name: name.to_string(),
-        level,
-        active: level > 0,
-        detail: detail.to_string(),
     }
 }
 
@@ -362,13 +268,6 @@ fn reported_string(value: Reported<String>) -> String {
         Reported::Value(value) => value,
         Reported::Unavailable => "unavailable".to_string(),
         Reported::Unreported => "unreported".to_string(),
-    }
-}
-
-fn reported_u8(value: Reported<u8>) -> u8 {
-    match value {
-        Reported::Value(value) => value,
-        Reported::Unavailable | Reported::Unreported => 0,
     }
 }
 
@@ -385,22 +284,6 @@ fn reported_bool(value: Reported<&bool>, yes: &str, no: &str, unknown: &str) -> 
     }
 }
 
-fn bool_level(value: &Reported<bool>) -> u8 {
-    match value {
-        Reported::Value(true) => 100,
-        Reported::Value(false) | Reported::Unavailable | Reported::Unreported => 0,
-    }
-}
-
-fn detail_bool<'a>(value: &Reported<bool>, yes: &'a str, no: &'a str) -> &'a str {
-    match value {
-        Reported::Value(true) => yes,
-        Reported::Value(false) => no,
-        Reported::Unavailable => "unavailable",
-        Reported::Unreported => "unreported",
-    }
-}
-
 #[cfg(test)]
 mod runtime_tests {
     use super::*;
@@ -412,7 +295,6 @@ mod runtime_tests {
         assert_eq!(state.backend, BackendKind::Missing);
         assert_eq!(state.model_label, "unreported");
         assert_eq!(state.tools_active, 0);
-        assert_eq!(state.cpu_percent, 0);
         assert!(state.pending_approval.is_none());
         assert!(
             !state
@@ -423,17 +305,13 @@ mod runtime_tests {
     }
 
     #[test]
-    fn live_runtime_uses_reported_model_and_metrics() {
+    fn live_runtime_uses_reported_model() {
         let mut snapshot = RuntimeSnapshot::missing("hermes");
         snapshot.backend = BackendKind::Hermes;
         snapshot.backend_label = "HERMES".to_string();
         snapshot.reachable = true;
         snapshot.model_label = Reported::Value("claude-local".to_string());
-        snapshot.cpu_percent = Reported::Value(31);
-        snapshot.memory_percent = Reported::Value(44);
         let state = CockpitState::from_runtime(snapshot);
         assert_eq!(state.model_label, "claude-local");
-        assert_eq!(state.cpu_percent, 31);
-        assert_eq!(state.memory_percent, 44);
     }
 }

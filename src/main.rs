@@ -6,6 +6,7 @@ mod doctor;
 mod domain;
 mod engine;
 mod hud;
+mod install;
 mod intent;
 mod runtime;
 mod setup;
@@ -23,5 +24,6 @@ fn main() -> Result<()> {
         Command::Status(args) => app::print_status(args),
         Command::Config(args) => config::print_effective(args),
         Command::Tui(args) => tui::run(args),
+        Command::Install(args) => install::run(args),
     }
 }

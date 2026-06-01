@@ -1,4 +1,135 @@
-/target
+# =============================================================================
+# Avu — Wake-capable terminal cockpit over Hermes/OpenClaw
+# Detailed .gitignore
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Rust / Cargo build artifacts
+# -----------------------------------------------------------------------------
+/target/
+**/*.rs.bk
+**/*.rs.fls
+
+# -----------------------------------------------------------------------------
+# Node / npm wrapper artifacts
+# -----------------------------------------------------------------------------
+node_modules/
+npm/bin/native/*
+*.tgz
+
+# -----------------------------------------------------------------------------
+# Operating system files
+# -----------------------------------------------------------------------------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# -----------------------------------------------------------------------------
+# IDE / Editor files
+# -----------------------------------------------------------------------------
+# JetBrains (IntelliJ, CLion, RustRover)
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# VS Code
+.vscode/
+*.code-workspace
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# Vim / Neovim
+*.swp
+*.swo
+*.swn
+Session.vim
+.netrwhist
+[._]*.s[a-v][a-z]
+[._]*.sw[a-p]
+[._]s[a-rt-v][a-z]
+[._]ss[a-gi-z]
+
+# Emacs
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+auto-save-list
+tramp
+.\#*
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Helix
+.helix/
+
+# -----------------------------------------------------------------------------
+# Environment and secrets
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+
+# -----------------------------------------------------------------------------
+# Avu runtime / config directories (user-local, never committed)
+# -----------------------------------------------------------------------------
+.avu/
+
+# -----------------------------------------------------------------------------
+# Log files
+# -----------------------------------------------------------------------------
+*.log
+logs/
+
+# -----------------------------------------------------------------------------
+# Research / reference documents (kept out of VCS)
+# -----------------------------------------------------------------------------
 2026-05-31-termdeck-deep-research.md
 hermes_voice_tui_research_report.md
+docs/
+!docs/
+docs/*
+!docs/superpowers/
+docs/superpowers/*
+!docs/superpowers/specs/
+!docs/superpowers/specs/**
+!docs/superpowers/plans/
+!docs/superpowers/plans/**
+
+# -----------------------------------------------------------------------------
+# Design assets / screenshots (large binary files)
+# -----------------------------------------------------------------------------
 ui.png
+*.svg
+*.sketch
+*.fig
+
+# -----------------------------------------------------------------------------
+# Coverage / test artifacts
+# -----------------------------------------------------------------------------
+tarpaulin-report.html
+cobertura.xml
+lcov.info
+coverage/

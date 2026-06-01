@@ -1,4 +1,4 @@
-use crate::domain::{CockpitMode, CockpitState, EventKind, ModuleStatus};
+use crate::domain::{CockpitMode, CockpitState, EventKind};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum PipelineStage {
@@ -33,7 +33,6 @@ pub struct CockpitProjection {
     pub mode: CockpitMode,
     pub voice_label: String,
     pub tools_active: u16,
-    pub modules: Vec<ModuleStatus>,
 }
 
 pub fn project_events(state: &CockpitState) -> CockpitProjection {
@@ -43,27 +42,16 @@ pub fn project_events(state: &CockpitState) -> CockpitProjection {
         CockpitMode::Disconnected
     };
     let mut tools_active = 0u16;
-    let mut input_level = 10u8;
-    let mut voice_level = 0u8;
-    let mut network_level = if state.capabilities.reachable { 80 } else { 8 };
-    let mut agent_level = if state.capabilities.events { 76 } else { 15 };
-    let mut nlp_level = 0u8;
-    let mut tts_level = 0u8;
-
     for event in &state.events {
         match PipelineStage::from_event(&event.kind) {
             PipelineStage::Input => {
                 mode = CockpitMode::Listening;
-                input_level = 82;
-                voice_level = 88;
             }
             PipelineStage::Wake => {
                 mode = CockpitMode::WakeDetected;
-                voice_level = 100;
             }
             PipelineStage::Processing => {
                 mode = CockpitMode::Processing;
-                nlp_level = 72;
             }
             PipelineStage::Tooling if matches!(event.kind, EventKind::ToolStart) => {
                 mode = CockpitMode::ToolActive;
@@ -74,31 +62,24 @@ pub fn project_events(state: &CockpitState) -> CockpitProjection {
             }
             PipelineStage::Approval if matches!(event.kind, EventKind::ApprovalRequested) => {
                 mode = CockpitMode::ApprovalNeeded;
-                agent_level = 95;
             }
             PipelineStage::Approval => {
                 mode = CockpitMode::Processing;
             }
             PipelineStage::Responding => {
                 mode = CockpitMode::Processing;
-                nlp_level = 90;
             }
             PipelineStage::Speaking => {
                 mode = CockpitMode::Speaking;
-                tts_level = 84;
             }
             PipelineStage::Idle if matches!(event.kind, EventKind::Idle) => {
                 if state.pending_approval.is_none() {
                     mode = CockpitMode::Idle;
                 }
             }
-            PipelineStage::Idle if matches!(event.kind, EventKind::Warning) => {
-                network_level = network_level.max(20);
-            }
+            PipelineStage::Idle if matches!(event.kind, EventKind::Warning) => {}
             PipelineStage::Idle => {
                 mode = CockpitMode::Error;
-                network_level = 0;
-                agent_level = 0;
             }
         }
     }
@@ -120,20 +101,6 @@ pub fn project_events(state: &CockpitState) -> CockpitProjection {
         mode,
         voice_label,
         tools_active,
-        modules: vec![
-            module("INPUT", input_level, input_level > 20, "capture"),
-            module("VOICE", voice_level, voice_level > 20, "wake/PTT"),
-            module(
-                "TOOLS",
-                (tools_active.min(4) * 25) as u8,
-                tools_active > 0,
-                "backend",
-            ),
-            module("NET", network_level, network_level > 30, "gateway"),
-            module("AGENT", agent_level, agent_level > 30, "attached"),
-            module("NLP", nlp_level, nlp_level > 20, "intent"),
-            module("TTS", tts_level, tts_level > 20, "speak"),
-        ],
     }
 }
 
@@ -145,7 +112,6 @@ pub fn apply_projection(state: &mut CockpitState) {
     state.mode = projection.mode;
     state.voice_label = projection.voice_label;
     state.tools_active = projection.tools_active;
-    state.modules = projection.modules;
 }
 
 fn is_runtime_snapshot_state(state: &CockpitState) -> bool {
@@ -179,15 +145,6 @@ fn is_runtime_snapshot_state(state: &CockpitState) -> bool {
 pub fn push_event(state: &mut CockpitState, event: crate::domain::CockpitEvent) {
     state.events.push(event);
     apply_projection(state);
-}
-
-fn module(name: &str, level: u8, active: bool, detail: &str) -> ModuleStatus {
-    ModuleStatus {
-        name: name.to_string(),
-        level: level.min(100),
-        active,
-        detail: detail.to_string(),
-    }
 }
 
 #[cfg(test)]
