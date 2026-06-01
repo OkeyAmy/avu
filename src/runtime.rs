@@ -66,9 +66,8 @@ pub fn hermes_snapshot(command_exists: bool) -> RuntimeSnapshot {
 
     let status = command_json("hermes", &["status", "--json"]);
     let status_text = command_text("hermes", &["status"]);
-    let doctor_text = command_text("hermes", &["doctor"]);
     let configured_model = command_text("hermes", &["config", "get", "model"]);
-    let reachable = status.is_some() || status_text.is_some() || doctor_text.is_some();
+    let reachable = status.is_some() || status_text.is_some();
     let log_events = read_hermes_log_events();
     let mut notes =
         vec!["Hermes command detected; events sourced from hermes logs agent".to_string()];
@@ -82,7 +81,11 @@ pub fn hermes_snapshot(command_exists: bool) -> RuntimeSnapshot {
         backend: BackendKind::Hermes,
         backend_label: "HERMES".to_string(),
         reachable,
-        model_label: model_from_backend(&status, configured_model.as_deref()),
+        model_label: model_from_backend(
+            &status,
+            status_text.as_deref(),
+            configured_model.as_deref(),
+        ),
         events: json_bool(&status, &["events", "capabilities.events"]),
         approvals: json_bool(&status, &["approvals", "capabilities.approvals"]),
         interrupt: json_bool(&status, &["interrupt", "capabilities.interrupt"]),
@@ -118,7 +121,7 @@ pub fn openclaw_snapshot(command_exists: bool) -> RuntimeSnapshot {
         backend: BackendKind::OpenClaw,
         backend_label: "OPENCLAW".to_string(),
         reachable,
-        model_label: model_from_backend(&status, None),
+        model_label: model_from_backend(&status, None, None),
         events: json_bool(&gateway, &["events", "capabilities.events"]),
         approvals: json_bool(&gateway, &["approvals", "capabilities.approvals"]),
         interrupt: json_bool(&gateway, &["interrupt", "capabilities.interrupt"]),
@@ -380,7 +383,11 @@ fn json_string(json: &Option<Value>, paths: &[&str]) -> Reported<String> {
     Reported::Unreported
 }
 
-fn model_from_backend(status: &Option<Value>, config_model: Option<&str>) -> Reported<String> {
+fn model_from_backend(
+    status: &Option<Value>,
+    status_text: Option<&str>,
+    config_model: Option<&str>,
+) -> Reported<String> {
     let from_status = json_string(
         status,
         &[
@@ -399,10 +406,29 @@ fn model_from_backend(status: &Option<Value>, config_model: Option<&str>) -> Rep
     if !matches!(from_status, Reported::Unreported) {
         return from_status;
     }
+    if let Some(model) = model_from_status_text(status_text) {
+        return Reported::Value(model);
+    }
     config_model
         .filter(|value| !value.trim().is_empty())
         .map(|value| Reported::Value(value.trim().to_string()))
         .unwrap_or(Reported::Unreported)
+}
+
+fn model_from_status_text(status_text: Option<&str>) -> Option<String> {
+    let text = status_text?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some((label, value)) = trimmed.split_once(':')
+            && label.trim().eq_ignore_ascii_case("model")
+        {
+            let model = value.trim();
+            if !model.is_empty() {
+                return Some(model.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -419,15 +445,28 @@ mod tests {
     fn model_comes_from_backend_status_before_config_fallback() {
         let status = Some(serde_json::json!({ "model": { "model": "gpt-5.4" } }));
         assert_eq!(
-            model_from_backend(&status, Some("fallback-model")),
+            model_from_backend(&status, None, Some("fallback-model")),
             Reported::Value("gpt-5.4".to_string())
+        );
+    }
+
+    #[test]
+    fn model_can_come_from_human_status_text() {
+        let status_text = r#"
+◆ Environment
+  Model:        openrouter/owl-alpha
+  Provider:     OpenRouter
+"#;
+        assert_eq!(
+            model_from_backend(&None, Some(status_text), None),
+            Reported::Value("openrouter/owl-alpha".to_string())
         );
     }
 
     #[test]
     fn model_can_fall_back_to_backend_config_command() {
         assert_eq!(
-            model_from_backend(&None, Some("claude-sonnet")),
+            model_from_backend(&None, None, Some("claude-sonnet")),
             Reported::Value("claude-sonnet".to_string())
         );
     }
