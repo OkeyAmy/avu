@@ -6,7 +6,7 @@ const { spawnSync } = require("node:child_process");
 const { createHash } = require("node:crypto");
 
 const repo = "https://github.com/OkeyAmy/avu";
-const version = process.env.AVU_INSTALL_VERSION || require("../package.json").version;
+const version = process.env.AVU_INSTALL_VERSION || require("../../package.json").version;
 
 function target() {
   const arch = process.arch;
