@@ -296,7 +296,7 @@ ensure_path() {
   export PATH="${AVU_BIN_DIR}:${PATH}"
 
   local path_line
-  path_line="export PATH=\"${AVU_BIN_DIR}:\$PATH\""
+  path_line="case \":\$PATH:\" in *\":${AVU_BIN_DIR}:\"*) ;; *) export PATH=\"${AVU_BIN_DIR}:\$PATH\" ;; esac"
 
   case "${shell_type}" in
     bash)
