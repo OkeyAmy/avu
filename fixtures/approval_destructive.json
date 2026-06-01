@@ -1,0 +1,49 @@
+{
+  "app_name": "Avu",
+  "mode": "approval_needed",
+  "backend": "fake",
+  "backend_label": "HERMES/FIXTURE",
+  "model_label": "local",
+  "voice_label": "LISTENING",
+  "tools_active": 2,
+  "cpu_percent": 12,
+  "memory_percent": 28,
+  "capabilities": {
+    "backend": "fake",
+    "reachable": true,
+    "events": true,
+    "approvals": true,
+    "interrupt": true,
+    "pause_resume": true,
+    "sessions_list": true,
+    "transcript": true,
+    "wake_available": false,
+    "permission_posture": "route_approval_responses",
+    "notes": ["fixture backend: safe for setup rehearsal"]
+  },
+  "modules": [
+    { "name": "INPUT", "level": 85, "active": true, "detail": "mic armed" },
+    { "name": "VOICE", "level": 92, "active": true, "detail": "wake visible" },
+    { "name": "TOOLS", "level": 72, "active": true, "detail": "2 active" },
+    { "name": "NET", "level": 64, "active": true, "detail": "gateway ok" },
+    { "name": "AGENT", "level": 80, "active": true, "detail": "attached" },
+    { "name": "NLP", "level": 58, "active": true, "detail": "intent ready" },
+    { "name": "TTS", "level": 15, "active": false, "detail": "muted" }
+  ],
+  "events": [
+    { "at": "2026-06-01T12:00:01Z", "kind": "listening", "label": "listening" },
+    { "at": "2026-06-01T12:00:02Z", "kind": "wake_word", "label": "wake_word" },
+    { "at": "2026-06-01T12:00:02Z", "kind": "processing", "label": "processing" },
+    { "at": "2026-06-01T12:00:03Z", "kind": "tool_start", "label": "tool:web.search" },
+    { "at": "2026-06-01T12:00:04Z", "kind": "tool_start", "label": "tool:terminal" },
+    { "at": "2026-06-01T12:00:05Z", "kind": "approval_requested", "label": "approval:terminal" }
+  ],
+  "pending_approval": {
+    "id": "approval-fixture-001",
+    "backend": "hermes",
+    "summary": "Hermes is asking to run a cache cleanup command",
+    "command": "rm -rf build-cache",
+    "severity": "destructive",
+    "requires_second_confirmation": true
+  }
+}
