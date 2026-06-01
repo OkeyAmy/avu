@@ -196,6 +196,26 @@ verify_archive() {
   fi
 }
 
+append_path_once() {
+  local config_file="$1"
+  local line="$2"
+  local marker="$3"
+
+  mkdir -p "$(dirname "${config_file}")"
+  touch "${config_file}"
+
+  if grep -v '^[[:space:]]*#' "${config_file}" 2>/dev/null | grep -Fq "${AVU_BIN_DIR}"; then
+    ok "${AVU_BIN_DIR} already configured in ${config_file}"
+    return 0
+  fi
+
+  {
+    printf '\n# %s\n' "${marker}"
+    printf '%s\n' "${line}"
+  } >> "${config_file}"
+  ok "Added ${AVU_BIN_DIR} to PATH in ${config_file}"
+}
+
 # ─── Step 7: Install binary ──────────────────────────────────────────────────
 install_binary() {
   info "Installing avu binary..."
@@ -275,32 +295,28 @@ ensure_path() {
 
   export PATH="${AVU_BIN_DIR}:${PATH}"
 
-  # Print shell-specific repair instructions
-  echo ""
-  info "To make this permanent, add this to your shell config:"
-  echo ""
+  local path_line
+  path_line="export PATH=\"${AVU_BIN_DIR}:\$PATH\""
 
   case "${shell_type}" in
     bash)
-      echo "  echo 'export PATH=\"${AVU_BIN_DIR}:\$PATH\"' >> ~/.bashrc"
-      echo "  source ~/.bashrc"
+      append_path_once "${HOME}/.bashrc" "${path_line}" "Avu — ensure ${AVU_BIN_DIR} is on PATH"
+      append_path_once "${HOME}/.profile" "${path_line}" "Avu — ensure ${AVU_BIN_DIR} is on PATH for login shells"
       ;;
     zsh)
-      echo "  echo 'export PATH=\"${AVU_BIN_DIR}:\$PATH\"' >> ~/.zshrc"
-      echo "  source ~/.zshrc"
+      append_path_once "${HOME}/.zshrc" "${path_line}" "Avu — ensure ${AVU_BIN_DIR} is on PATH"
+      append_path_once "${HOME}/.zprofile" "${path_line}" "Avu — ensure ${AVU_BIN_DIR} is on PATH for login shells"
       ;;
     fish)
-      echo "  fish_add_path ${AVU_BIN_DIR}"
-      echo "  echo 'fish_add_path ${AVU_BIN_DIR}' >> ~/.config/fish/config.fish"
+      append_path_once "${HOME}/.config/fish/config.fish" "fish_add_path ${AVU_BIN_DIR}" "Avu — ensure ${AVU_BIN_DIR} is on PATH"
       ;;
     *)
-      echo "  export PATH=\"${AVU_BIN_DIR}:\$PATH\""
-      echo "  (Add this line to your shell's rc file)"
+      append_path_once "${HOME}/.profile" "${path_line}" "Avu — ensure ${AVU_BIN_DIR} is on PATH"
       ;;
   esac
 
   echo ""
-  warn "Open a new terminal or source your rc file to persist the PATH change."
+  warn "Open a new terminal or run: export PATH=\"${AVU_BIN_DIR}:\$PATH\""
 }
 
 # ─── Step 9: Verify installation ─────────────────────────────────────────────
