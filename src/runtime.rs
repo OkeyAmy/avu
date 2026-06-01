@@ -65,10 +65,18 @@ pub fn hermes_snapshot(command_exists: bool) -> RuntimeSnapshot {
     }
 
     let status = command_json("hermes", &["status", "--json"]);
-    let doctor = command_json("hermes", &["doctor", "--json"]);
+    let status_text = command_text("hermes", &["status"]);
+    let doctor_text = command_text("hermes", &["doctor"]);
     let configured_model = command_text("hermes", &["config", "get", "model"]);
-    let reachable = status.is_some() || doctor.is_some();
+    let reachable = status.is_some() || status_text.is_some() || doctor_text.is_some();
     let log_events = read_hermes_log_events();
+    let mut notes =
+        vec!["Hermes command detected; events sourced from hermes logs agent".to_string()];
+    if status.is_none() {
+        notes.push(
+            "Hermes status JSON unavailable; capability detection is degraded until Hermes exposes machine-readable status".to_string(),
+        );
+    }
 
     RuntimeSnapshot {
         backend: BackendKind::Hermes,
@@ -84,7 +92,7 @@ pub fn hermes_snapshot(command_exists: bool) -> RuntimeSnapshot {
         wake_available: Reported::Unreported,
         permission_posture: PermissionPosture::ObserveNotify,
         log_events,
-        notes: vec!["Hermes command detected; events sourced from hermes logs agent".to_string()],
+        notes,
     }
 }
 
@@ -95,8 +103,16 @@ pub fn openclaw_snapshot(command_exists: bool) -> RuntimeSnapshot {
 
     let gateway = command_json("openclaw", &["gateway", "status", "--json"]);
     let status = command_json("openclaw", &["status", "--json"]);
-    let reachable = gateway.is_some() || status.is_some();
+    let gateway_text = command_text("openclaw", &["gateway", "status"]);
+    let reachable = gateway.is_some() || status.is_some() || gateway_text.is_some();
     let log_events = read_openclaw_log_events();
+    let mut notes =
+        vec!["OpenClaw command detected; events sourced from openclaw logs --json".to_string()];
+    if gateway.is_none() {
+        notes.push(
+            "OpenClaw gateway status JSON unavailable; run openclaw onboard or openclaw gateway status to finish backend setup".to_string(),
+        );
+    }
 
     RuntimeSnapshot {
         backend: BackendKind::OpenClaw,
@@ -112,9 +128,7 @@ pub fn openclaw_snapshot(command_exists: bool) -> RuntimeSnapshot {
         wake_available: Reported::Unreported,
         permission_posture: PermissionPosture::ObserveNotify,
         log_events,
-        notes: vec![
-            "OpenClaw command detected; events sourced from openclaw logs --json".to_string(),
-        ],
+        notes,
     }
 }
 

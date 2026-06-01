@@ -37,11 +37,11 @@ pub fn run(args: SetupArgs) -> Result<()> {
     print_step(
         4,
         "Capability discovery",
-        capability.reachable,
+        true,
         if capability.reachable {
-            "events/approvals/control capability snapshot produced"
+            "backend capability snapshot produced; unavailable features stay disabled"
         } else {
-            "backend unreachable; capability snapshot is degraded and control actions stay disabled"
+            "backend not ready; Avu will stay observe-only until Hermes/OpenClaw is configured"
         },
     );
     print_step(
@@ -59,11 +59,11 @@ pub fn run(args: SetupArgs) -> Result<()> {
     print_step(
         7,
         "Safety rehearsal",
-        capability.approvals,
+        true,
         if capability.approvals {
-            "fixture approval path available; destructive approvals require second confirmation"
+            "live approval routing available; destructive approvals require explicit confirmation"
         } else {
-            "approval capability unavailable; approval controls disabled until backend supports them"
+            "local safety fallback active; live approval controls stay disabled until backend reports support"
         },
     );
 

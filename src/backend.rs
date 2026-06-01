@@ -4,7 +4,7 @@ use crate::{
     runtime,
 };
 use anyhow::{Context, Result};
-use std::{path::Path, process::Command};
+use std::{env, path::Path};
 
 pub trait BackendAdapter {
     fn label(&self) -> &'static str;
@@ -104,10 +104,13 @@ pub fn load_fixture(path: &Path) -> Result<CockpitState> {
 }
 
 pub fn command_exists(command: &str) -> bool {
-    Command::new(command)
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
+    env::var_os("PATH")
+        .map(|paths| {
+            env::split_paths(&paths).any(|dir| {
+                let candidate = dir.join(command);
+                candidate.is_file() || (cfg!(windows) && candidate.with_extension("exe").is_file())
+            })
+        })
         .unwrap_or(false)
 }
 

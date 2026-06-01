@@ -12,7 +12,7 @@ You (terminal)
   ▼
 Avu cockpit (ratatui TUI)
   │
-  ├── Hermes adapter ──► hermes logs, hermes status --json, hermes doctor --json
+  ├── Hermes adapter ──► hermes logs, hermes status, hermes doctor
   ├── OpenClaw adapter ──► openclaw logs --json, openclaw gateway status --json
   └── System probes ──► /proc/stat, /proc/meminfo, PATH detection
 ```
@@ -34,7 +34,7 @@ Avu owns the cockpit UX and command routing. Backends own approvals, permissions
 
 Avu discovers which backend is available and adapts automatically:
 
-- **Hermes** — probes via `hermes status --json`, `hermes doctor --json`, reads events from `hermes logs agent`.
+- **Hermes** — probes via `hermes status`/`hermes doctor` with JSON fallback when available, reads events from `hermes logs agent`.
 - **OpenClaw** — probes via `openclaw gateway status --json`, `openclaw status --json`, reads events from `openclaw logs --json`.
 - **Auto** — detects `hermes` or `openclaw` on PATH. If neither is found, reports disconnected state instead of faking data.
 - **Fake** — explicit `--backend fake` for testing with fixture data.
@@ -67,7 +67,7 @@ Avu does not require users to install Rust, Cargo, Python, ripgrep, ffmpeg, Port
 - **Hermes** installer handles `uv`, Python 3.11, Node.js 22, ripgrep, ffmpeg, virtualenv, PATH setup, and `~/.hermes/` config/state.
 - **OpenClaw** installer handles Node 24 or Node 22.19+, npm/git install modes, gateway service setup, onboarding, PATH setup, and `~/.openclaw` state.
 
-Avu reads backend-reported status/config/logs (`hermes status`, `hermes config get model`, `hermes logs`, `openclaw status --json`, `openclaw gateway status --json`, `openclaw logs`) instead of inventing model names, tool state, provider state, or host metrics.
+Avu reads backend-reported status/config/logs (`hermes status`, `hermes doctor`, `hermes logs`, `openclaw status --json`, `openclaw gateway status --json`, `openclaw logs`) instead of inventing model names, tool state, provider state, or host metrics.
 
 Because both supported backends provide or require Node, Avu's normal package path is Node/npm plus a prebuilt release binary. Rust is only for contributors building Avu itself.
 

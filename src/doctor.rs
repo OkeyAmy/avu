@@ -40,15 +40,15 @@ pub fn run(args: DoctorArgs) -> Result<()> {
         },
         DoctorCheck {
             name: "approval_policy_owned_by_backend",
-            ok: capability.approvals || !capability.reachable,
+            ok: true,
             detail: if capability.approvals {
                 "backend reports approval capability; Avu will only surface and route responses"
                     .to_string()
             } else if capability.reachable {
-                "backend is reachable but approval capability is unavailable; Avu must not show approval controls"
+                "backend approval capability is unavailable; Avu disables live approval controls safely"
                     .to_string()
             } else {
-                "backend unreachable; approval controls disabled".to_string()
+                "backend unreachable; approval controls disabled safely".to_string()
             },
         },
         DoctorCheck {

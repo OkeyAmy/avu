@@ -49,6 +49,34 @@ fn setup_fake_runs_terminal_wizard_checks() {
 }
 
 #[test]
+fn setup_remote_keeps_capability_and_safety_nonfatal() {
+    let mut cmd = Command::cargo_bin("avu").expect("binary exists");
+    cmd.args(["setup", "--backend", "remote", "--non-interactive"]);
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "3. [!!] Backend health verification",
+        ))
+        .stdout(predicate::str::contains("4. [ok] Capability discovery"))
+        .stdout(predicate::str::contains("7. [ok] Safety rehearsal"));
+}
+
+#[test]
+fn doctor_remote_disables_approval_controls_safely() {
+    let mut cmd = Command::cargo_bin("avu").expect("binary exists");
+    cmd.args(["doctor", "--backend", "remote"]);
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("[!!] backend_reachable"))
+        .stdout(predicate::str::contains(
+            "[ok] approval_policy_owned_by_backend",
+        ))
+        .stdout(predicate::str::contains(
+            "approval controls disabled safely",
+        ));
+}
+
+#[test]
 fn hermes_status_does_not_show_fake_approval_when_unavailable() {
     let mut cmd = Command::cargo_bin("avu").expect("binary exists");
     cmd.args(["status", "--backend", "hermes"]);
