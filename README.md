@@ -109,7 +109,7 @@ iwr -useb https://raw.githubusercontent.com/OkeyAmy/avu/master/scripts/install.p
 npm install -g github:OkeyAmy/avu#master
 ```
 
-The npm wrapper downloads the matching prebuilt Avu binary from GitHub Releases. If npm is unavailable, install Hermes or OpenClaw first and open a fresh terminal so their Node/npm runtime is on PATH.
+The npm wrapper downloads the matching prebuilt Avu binary from GitHub Releases on the first `avu` command. If npm is unavailable, install Hermes or OpenClaw first and open a fresh terminal so their Node/npm runtime is on PATH.
 
 ### Developer source build
 ```bash
@@ -177,7 +177,7 @@ The secure release workflow builds and uploads:
 - `SHA256SUMS.sig`
 - `SHA256SUMS.pem`
 
-Installers download `SHA256SUMS` and verify the selected archive before extraction. Security-conscious users can also verify release provenance and checksum signatures:
+The npm wrapper downloads `SHA256SUMS` and verifies the selected archive on first run. Security-conscious users can also verify release provenance and checksum signatures:
 
 ```bash
 gh attestation verify avu-x86_64-unknown-linux-musl.tar.gz -R OkeyAmy/avu

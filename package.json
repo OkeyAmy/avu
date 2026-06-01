@@ -6,11 +6,9 @@
   "bin": {
     "avu": "npm/bin/avu.js"
   },
-  "scripts": {
-    "postinstall": "node npm/install.js"
-  },
+  "scripts": {},
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=20.0.0"
   },
   "files": [
     "npm/bin/avu.js",
