@@ -37,11 +37,11 @@ fn state_for_args(args: &TuiArgs) -> Result<CockpitState> {
 fn run_interactive(args: TuiArgs) -> Result<()> {
     let mut terminal = TerminalSession::start()?;
     let mut state = state_for_args(&args)?;
-    let mut tick = 0_u8;
+    let mut overlay = UiOverlay::default();
 
     loop {
         engine::apply_projection(&mut state);
-        terminal.draw(|frame| render(frame, &state))?;
+        terminal.draw(|frame| render_with_overlay(frame, &state, Some(&overlay)))?;
 
         if event::poll(Duration::from_millis(250))?
             && let Event::Key(key) = event::read()?
@@ -49,10 +49,38 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            if overlay.command_mode {
+                match key.code {
+                    KeyCode::Esc => {
+                        overlay.command_mode = false;
+                        overlay.command.clear();
+                        overlay.message = "command cancelled".to_string();
+                    }
+                    KeyCode::Enter => match handle_command(&mut state, &args, &mut overlay)? {
+                        CommandAction::Continue => {}
+                        CommandAction::Quit => break,
+                    },
+                    KeyCode::Backspace => {
+                        overlay.command.pop();
+                    }
+                    KeyCode::Char(ch) => overlay.command.push(ch),
+                    _ => {}
+                }
+                continue;
+            }
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                KeyCode::Char('s') => state = state_for_args(&args)?,
+                KeyCode::Char(':') => {
+                    overlay.command_mode = true;
+                    overlay.command.clear();
+                    overlay.message =
+                        "command mode: type help, status, refresh, or quit".to_string();
+                }
+                KeyCode::Char('s') => {
+                    state = state_for_args(&args)?;
+                    overlay.message = "status refreshed from backend".to_string();
+                }
                 KeyCode::Char('i') => push_operator_event(
                     &mut state,
                     EventKind::Warning,
@@ -66,15 +94,52 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
                 _ => {}
             }
         }
-
-        tick = tick.wrapping_add(1);
-        if tick >= 8 {
-            state = state_for_args(&args)?;
-            tick = 0;
-        }
     }
 
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct UiOverlay {
+    command_mode: bool,
+    command: String,
+    message: String,
+}
+
+enum CommandAction {
+    Continue,
+    Quit,
+}
+
+fn handle_command(
+    state: &mut CockpitState,
+    args: &TuiArgs,
+    overlay: &mut UiOverlay,
+) -> Result<CommandAction> {
+    let command = overlay.command.trim().to_ascii_lowercase();
+    overlay.command_mode = false;
+    overlay.command.clear();
+    match command.as_str() {
+        "q" | "quit" | "exit" => Ok(CommandAction::Quit),
+        "s" | "status" | "refresh" => {
+            *state = state_for_args(args)?;
+            overlay.message = "status refreshed from backend".to_string();
+            Ok(CommandAction::Continue)
+        }
+        "help" | "h" | "?" => {
+            overlay.message =
+                "keys: q quit · s refresh · i interrupt note · m mute note · : command".to_string();
+            Ok(CommandAction::Continue)
+        }
+        "" => {
+            overlay.message.clear();
+            Ok(CommandAction::Continue)
+        }
+        other => {
+            overlay.message = format!("unknown command: {other}");
+            Ok(CommandAction::Continue)
+        }
+    }
 }
 
 fn push_operator_event(state: &mut CockpitState, kind: EventKind, label: &str) {
@@ -135,6 +200,14 @@ pub fn render_to_string(state: &CockpitState, width: u16, height: u16) -> Result
 }
 
 fn render(frame: &mut ratatui::Frame<'_>, state: &CockpitState) {
+    render_with_overlay(frame, state, None);
+}
+
+fn render_with_overlay(
+    frame: &mut ratatui::Frame<'_>,
+    state: &CockpitState,
+    overlay: Option<&UiOverlay>,
+) {
     let root = frame.area();
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -157,7 +230,7 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &CockpitState) {
         render_core(frame, main[0], state);
         render_activity(frame, main[1], state);
     }
-    render_footer(frame, vertical[1], state);
+    render_footer(frame, vertical[1], state, overlay);
 }
 
 fn render_core(frame: &mut ratatui::Frame<'_>, area: Rect, state: &CockpitState) {
@@ -327,7 +400,23 @@ fn render_activity(frame: &mut ratatui::Frame<'_>, area: Rect, state: &CockpitSt
     frame.render_widget(list, area);
 }
 
-fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &CockpitState) {
+fn render_footer(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    state: &CockpitState,
+    overlay: Option<&UiOverlay>,
+) {
+    let command_text = overlay
+        .map(|overlay| {
+            if overlay.command_mode {
+                format!("  │ CMD: :{}", overlay.command)
+            } else if overlay.message.is_empty() {
+                "  │ PRESS : for commands".to_string()
+            } else {
+                format!("  │ {}", overlay.message)
+            }
+        })
+        .unwrap_or_default();
     let footer = Paragraph::new(Line::from(vec![
         Span::styled(" BACKEND: ", Style::default().fg(Color::Cyan)),
         Span::raw(state.backend_label.clone()),
@@ -340,6 +429,7 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &CockpitStat
             format!("{} active", state.tools_active),
             Style::default().fg(Color::Yellow),
         ),
+        Span::styled(command_text, Style::default().fg(Color::LightGreen)),
     ]))
     .block(
         Block::default()
