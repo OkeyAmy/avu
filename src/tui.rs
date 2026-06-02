@@ -13,7 +13,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
-use std::{io, time::Duration};
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 
 pub fn run(args: TuiArgs) -> Result<()> {
     if args.once {
@@ -38,10 +41,16 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
     let mut terminal = TerminalSession::start()?;
     let mut state = state_for_args(&args)?;
     let mut overlay = UiOverlay::default();
+    let mut last_refresh = Instant::now();
 
     loop {
         engine::apply_projection(&mut state);
         terminal.draw(|frame| render_with_overlay(frame, &state, Some(&overlay)))?;
+
+        if last_refresh.elapsed() >= Duration::from_secs(2) && !overlay.is_typing() {
+            state = state_for_args(&args)?;
+            last_refresh = Instant::now();
+        }
 
         if event::poll(Duration::from_millis(250))?
             && let Event::Key(key) = event::read()?
@@ -49,22 +58,10 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            if overlay.command_mode {
-                match key.code {
-                    KeyCode::Esc => {
-                        overlay.command_mode = false;
-                        overlay.command.clear();
-                        overlay.message = "command cancelled".to_string();
-                    }
-                    KeyCode::Enter => match handle_command(&mut state, &args, &mut overlay)? {
-                        CommandAction::Continue => {}
-                        CommandAction::Quit => break,
-                    },
-                    KeyCode::Backspace => {
-                        overlay.command.pop();
-                    }
-                    KeyCode::Char(ch) => overlay.command.push(ch),
-                    _ => {}
+            if overlay.input_mode.is_some() {
+                match handle_input_key(&mut state, &args, &mut overlay, key.code)? {
+                    CommandAction::Continue => {}
+                    CommandAction::Quit => break,
                 }
                 continue;
             }
@@ -72,10 +69,10 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                 KeyCode::Char(':') => {
-                    overlay.command_mode = true;
-                    overlay.command.clear();
+                    overlay.input_mode = Some(InputMode::Picker);
+                    overlay.input.clear();
                     overlay.message =
-                        "command mode: type help, status, refresh, or quit".to_string();
+                        "choose input: [c] CMD shell · [t] Chat · [/] slash".to_string();
                 }
                 KeyCode::Char('s') => {
                     state = state_for_args(&args)?;
@@ -101,9 +98,22 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
 
 #[derive(Debug, Default)]
 struct UiOverlay {
-    command_mode: bool,
-    command: String,
+    input_mode: Option<InputMode>,
+    input: String,
     message: String,
+}
+
+impl UiOverlay {
+    fn is_typing(&self) -> bool {
+        self.input_mode.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum InputMode {
+    Picker,
+    Command,
+    Chat,
 }
 
 enum CommandAction {
@@ -118,36 +128,107 @@ impl CommandAction {
     }
 }
 
-fn handle_command(
+fn handle_input_key(
     state: &mut CockpitState,
     args: &TuiArgs,
     overlay: &mut UiOverlay,
+    key_code: KeyCode,
 ) -> Result<CommandAction> {
-    let command = overlay.command.trim().to_ascii_lowercase();
-    overlay.command_mode = false;
-    overlay.command.clear();
-    match command.as_str() {
-        "q" | "quit" | "exit" => Ok(CommandAction::Quit),
-        "s" | "status" | "refresh" => {
-            *state = state_for_args(args)?;
-            overlay.message = "status refreshed from backend".to_string();
-            Ok(CommandAction::Continue)
+    match overlay.input_mode {
+        Some(InputMode::Picker) => handle_picker_key(state, args, overlay, key_code),
+        Some(InputMode::Command) | Some(InputMode::Chat) => {
+            handle_text_input_key(state, args, overlay, key_code)
         }
-        "help" | "h" | "?" => {
-            overlay.message =
-                "keys: q quit · s refresh · i interrupt note · m voice status · : /voice or prompt"
-                    .to_string();
-            Ok(CommandAction::Continue)
-        }
-        "" => {
-            overlay.message.clear();
-            Ok(CommandAction::Continue)
-        }
-        other => {
-            route_backend_prompt(state, args, overlay, other);
-            Ok(CommandAction::Continue)
-        }
+        None => Ok(CommandAction::Continue),
     }
+}
+
+fn handle_picker_key(
+    state: &mut CockpitState,
+    args: &TuiArgs,
+    overlay: &mut UiOverlay,
+    key_code: KeyCode,
+) -> Result<CommandAction> {
+    match key_code {
+        KeyCode::Esc => {
+            overlay.input_mode = None;
+            overlay.input.clear();
+            overlay.message = "input cancelled".to_string();
+        }
+        KeyCode::Char('c') => {
+            overlay.input_mode = Some(InputMode::Command);
+            overlay.message = "CMD mode: type a shell command, Enter to run".to_string();
+        }
+        KeyCode::Char('t') => {
+            overlay.input_mode = Some(InputMode::Chat);
+            overlay.message = "Chat mode: type a message for Hermes/OpenClaw".to_string();
+        }
+        KeyCode::Char('/') => {
+            overlay.input_mode = Some(InputMode::Chat);
+            overlay.input.push('/');
+            overlay.message = "Chat slash mode: send a backend slash command".to_string();
+        }
+        KeyCode::Char('s') => {
+            *state = state_for_args(args)?;
+            overlay.input_mode = None;
+            overlay.message = "status refreshed from backend".to_string();
+        }
+        KeyCode::Char('q') => return Ok(CommandAction::Quit),
+        _ => {}
+    }
+    Ok(CommandAction::Continue)
+}
+
+fn handle_text_input_key(
+    state: &mut CockpitState,
+    args: &TuiArgs,
+    overlay: &mut UiOverlay,
+    key_code: KeyCode,
+) -> Result<CommandAction> {
+    match key_code {
+        KeyCode::Esc => {
+            overlay.input_mode = None;
+            overlay.input.clear();
+            overlay.message = "input cancelled".to_string();
+        }
+        KeyCode::Enter => match overlay.input_mode {
+            Some(InputMode::Command) => run_shell_input(state, overlay),
+            Some(InputMode::Chat) => route_chat_input(state, args, overlay),
+            _ => {}
+        },
+        KeyCode::Backspace | KeyCode::Delete => {
+            overlay.input.pop();
+        }
+        KeyCode::Char(ch) => overlay.input.push(ch),
+        _ => {}
+    }
+    Ok(CommandAction::Continue)
+}
+
+fn run_shell_input(state: &mut CockpitState, overlay: &mut UiOverlay) {
+    let command = overlay.input.trim().to_string();
+    overlay.input_mode = None;
+    overlay.input.clear();
+    let result = backend::run_shell_command(&command);
+    let kind = if result.ok {
+        EventKind::ResponseStream
+    } else {
+        EventKind::Warning
+    };
+    let label = format!("cmd: {}", compact(&result.summary, 120));
+    push_operator_event(state, kind, &label);
+    overlay.message = if result.ok {
+        format!("cmd ok: {}", compact(&result.summary, 48))
+    } else {
+        format!("cmd failed: {}", compact(&result.summary, 48))
+    };
+}
+
+fn route_chat_input(state: &mut CockpitState, args: &TuiArgs, overlay: &mut UiOverlay) {
+    let prompt = overlay.input.trim().to_string();
+    overlay.input_mode = None;
+    overlay.input.clear();
+    route_backend_prompt(state, args, overlay, &prompt);
 }
 
 fn route_backend_prompt(
@@ -332,7 +413,7 @@ fn render_control_sheet(frame: &mut ratatui::Frame<'_>, area: Rect, state: &Cock
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("[s]status [i]interrupt [m]mute [q]quit"),
+        Span::raw("[s]status [:]CMD/Chat [m]voice help [q]quit"),
     ])];
 
     if let Some(approval) = state.pending_approval.as_ref() {
@@ -438,10 +519,16 @@ fn render_footer(
 ) {
     let command_text = overlay
         .map(|overlay| {
-            if overlay.command_mode {
-                format!("  │ CMD: :{}", overlay.command)
+            if let Some(input_mode) = overlay.input_mode {
+                match input_mode {
+                    InputMode::Picker => {
+                        "  │ INPUT: [c] CMD  [t] Chat  [/] Slash  [Esc] cancel".to_string()
+                    }
+                    InputMode::Command => format!("  │ CMD: {}", overlay.input),
+                    InputMode::Chat => format!("  │ Chat: {}", overlay.input),
+                }
             } else if overlay.message.is_empty() {
-                "  │ PRESS : for commands".to_string()
+                "  │ PRESS : for CMD/Chat".to_string()
             } else {
                 format!("  │ {}", overlay.message)
             }
@@ -516,12 +603,13 @@ mod tests {
         };
         let mut state = CockpitState::fake_listening();
         let mut overlay = UiOverlay {
-            command_mode: true,
-            command: "/voice".to_string(),
+            input_mode: Some(InputMode::Chat),
+            input: "/voice".to_string(),
             message: String::new(),
         };
 
-        let action = handle_command(&mut state, &args, &mut overlay).expect("command routes");
+        let action = handle_text_input_key(&mut state, &args, &mut overlay, KeyCode::Enter)
+            .expect("command routes");
 
         assert!(action.is_continue());
         assert!(overlay.message.contains("backend replied"));
@@ -529,5 +617,42 @@ mod tests {
             event.kind == EventKind::ResponseStream
                 && event.label.contains("fixture backend received: /voice")
         }));
+    }
+
+    #[test]
+    fn picker_exposes_cmd_and_chat_modes() {
+        let args = TuiArgs::default();
+        let mut state = CockpitState::fake_listening();
+        let mut overlay = UiOverlay {
+            input_mode: Some(InputMode::Picker),
+            input: String::new(),
+            message: String::new(),
+        };
+
+        handle_input_key(&mut state, &args, &mut overlay, KeyCode::Char('c'))
+            .expect("cmd mode selected");
+        assert_eq!(overlay.input_mode, Some(InputMode::Command));
+
+        overlay.input_mode = Some(InputMode::Picker);
+        handle_input_key(&mut state, &args, &mut overlay, KeyCode::Char('t'))
+            .expect("chat mode selected");
+        assert_eq!(overlay.input_mode, Some(InputMode::Chat));
+    }
+
+    #[test]
+    fn input_mode_supports_backspace_and_delete() {
+        let args = TuiArgs::default();
+        let mut state = CockpitState::fake_listening();
+        let mut overlay = UiOverlay {
+            input_mode: Some(InputMode::Chat),
+            input: "hello".to_string(),
+            message: String::new(),
+        };
+
+        handle_input_key(&mut state, &args, &mut overlay, KeyCode::Backspace)
+            .expect("backspace works");
+        assert_eq!(overlay.input, "hell");
+        handle_input_key(&mut state, &args, &mut overlay, KeyCode::Delete).expect("delete works");
+        assert_eq!(overlay.input, "hel");
     }
 }

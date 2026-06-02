@@ -4,7 +4,13 @@ use crate::{
     runtime,
 };
 use anyhow::{Context, Result};
-use std::{env, path::Path, process::Command, thread, time::Duration};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+    thread,
+    time::{Duration, SystemTime},
+};
 
 pub trait BackendAdapter {
     fn label(&self) -> &'static str;
@@ -17,6 +23,7 @@ pub trait BackendAdapter {
 pub struct BackendCommandResult {
     pub ok: bool,
     pub summary: String,
+    pub audio_path: Option<PathBuf>,
 }
 
 impl BackendCommandResult {
@@ -24,6 +31,7 @@ impl BackendCommandResult {
         Self {
             ok: true,
             summary: summary.into(),
+            audio_path: None,
         }
     }
 
@@ -31,7 +39,13 @@ impl BackendCommandResult {
         Self {
             ok: false,
             summary: summary.into(),
+            audio_path: None,
         }
+    }
+
+    fn with_audio(mut self, audio_path: Option<PathBuf>) -> Self {
+        self.audio_path = audio_path;
+        self
     }
 }
 
@@ -95,8 +109,8 @@ impl BackendAdapter for OpenClawBackend {
         CockpitState::from_runtime(runtime::openclaw_snapshot(command_exists("openclaw")))
     }
 
-    fn route_prompt(&self, _prompt: &str) -> BackendCommandResult {
-        BackendCommandResult::failed("OpenClaw prompt routing is not available yet")
+    fn route_prompt(&self, prompt: &str) -> BackendCommandResult {
+        run_command_prompt("openclaw", &["agent", "--message", prompt], None)
     }
 }
 
@@ -158,8 +172,72 @@ fn run_backend_prompt(command: &str, prompt: &str) -> BackendCommandResult {
         return BackendCommandResult::failed(format!("{command} command was not found on PATH"));
     }
 
+    let before_audio = latest_backend_audio(command);
+
+    let result = match command {
+        "hermes" => run_command_prompt(command, &["--oneshot", prompt], before_audio.as_ref()),
+        other => run_command_prompt(other, &[prompt], before_audio.as_ref()),
+    };
+
+    let after_audio = latest_backend_audio(command);
+    let new_audio = newer_audio(before_audio.as_ref(), after_audio.as_ref()).cloned();
+    let played = new_audio.as_ref().and_then(|path| play_audio(path));
+    let result = result.with_audio(new_audio.clone());
+
+    if let Some(audio_path) = new_audio {
+        let playback = played.unwrap_or_else(|| "no audio player found".to_string());
+        BackendCommandResult {
+            summary: format!(
+                "{} · audio: {} ({playback})",
+                result.summary,
+                audio_path.display()
+            ),
+            ..result
+        }
+    } else {
+        result
+    }
+}
+
+pub fn run_shell_command(command: &str) -> BackendCommandResult {
+    let command = command.trim();
+    if command.is_empty() {
+        return BackendCommandResult::failed("empty shell command");
+    }
+
+    let mut process = if cfg!(windows) {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", command]);
+        cmd
+    } else {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-lc", command]);
+        cmd
+    };
+
+    let output = match process
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => return BackendCommandResult::failed(format!("shell failed: {error}")),
+    };
+
+    summarize_output(output)
+}
+
+fn run_command_prompt(
+    command: &str,
+    args: &[&str],
+    _before_audio: Option<&AudioCandidate>,
+) -> BackendCommandResult {
+    if !command_exists(command) {
+        return BackendCommandResult::failed(format!("{command} command was not found on PATH"));
+    }
+
     let mut child = match Command::new(command)
-        .args(["--oneshot", prompt])
+        .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -192,6 +270,125 @@ fn run_backend_prompt(command: &str, prompt: &str) -> BackendCommandResult {
     let _ = child.kill();
     let _ = child.wait();
     BackendCommandResult::failed(format!("{command} prompt timed out after 45s"))
+}
+
+#[derive(Debug, Clone)]
+struct AudioCandidate {
+    path: PathBuf,
+    modified: SystemTime,
+}
+
+fn latest_backend_audio(command: &str) -> Option<AudioCandidate> {
+    let mut roots = Vec::new();
+    if command == "hermes" {
+        if let Some(root) = env::var_os("HERMES_AUDIO_CACHE_DIR") {
+            roots.push(PathBuf::from(root));
+        }
+        if let Some(home) = env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            roots.push(home.join(".hermes/audio_cache"));
+            roots.push(home.join(".hermes/cache/audio"));
+        }
+    } else if command == "openclaw" {
+        if let Some(root) = env::var_os("OPENCLAW_STATE_DIR") {
+            roots.push(PathBuf::from(root).join("media"));
+        }
+        if let Some(home) = env::var_os("HOME") {
+            roots.push(PathBuf::from(home).join(".openclaw/media"));
+        }
+    }
+
+    roots
+        .into_iter()
+        .filter(|root| root.exists())
+        .flat_map(audio_files_under)
+        .max_by_key(|candidate| candidate.modified)
+}
+
+fn audio_files_under(root: PathBuf) -> Vec<AudioCandidate> {
+    let mut files = Vec::new();
+    collect_audio_files(&root, &mut files, 0);
+    files
+}
+
+fn collect_audio_files(path: &Path, files: &mut Vec<AudioCandidate>, depth: u8) {
+    if depth > 3 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_audio_files(&path, files, depth + 1);
+            continue;
+        }
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        if !matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "mp3" | "wav" | "ogg" | "m4a"
+        ) {
+            continue;
+        }
+        if let Ok(metadata) = entry.metadata()
+            && let Ok(modified) = metadata.modified()
+        {
+            files.push(AudioCandidate { path, modified });
+        }
+    }
+}
+
+fn newer_audio<'a>(
+    before: Option<&AudioCandidate>,
+    after: Option<&'a AudioCandidate>,
+) -> Option<&'a PathBuf> {
+    let after = after?;
+    if before.is_none_or(|before| after.modified > before.modified) {
+        Some(&after.path)
+    } else {
+        None
+    }
+}
+
+fn play_audio(path: &Path) -> Option<String> {
+    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("afplay", &[])]
+    } else if cfg!(windows) {
+        &[(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-Command",
+                "(New-Object Media.SoundPlayer $args[0]).PlaySync()",
+            ],
+        )]
+    } else {
+        &[
+            ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet"]),
+            ("mpv", &["--really-quiet"]),
+            ("paplay", &[]),
+            ("aplay", &[]),
+            ("xdg-open", &[]),
+        ]
+    };
+
+    for (program, args) in candidates {
+        if !command_exists(program) {
+            continue;
+        }
+        let mut command = Command::new(program);
+        command.args(*args).arg(path);
+        match command.status() {
+            Ok(status) if status.success() => return Some(format!("played with {program}")),
+            Ok(_) => continue,
+            Err(_) => continue,
+        }
+    }
+    None
 }
 
 fn summarize_output(output: std::process::Output) -> BackendCommandResult {
@@ -241,5 +438,16 @@ mod tests {
         let result = MissingBackend.route_prompt("/voice");
         assert!(!result.ok);
         assert!(result.summary.contains("not found"));
+    }
+
+    #[test]
+    fn shell_command_returns_output_for_cmd_mode() {
+        let result = if cfg!(windows) {
+            run_shell_command("echo avu-cmd")
+        } else {
+            run_shell_command("printf avu-cmd")
+        };
+        assert!(result.ok);
+        assert_eq!(result.summary, "avu-cmd");
     }
 }
