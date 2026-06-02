@@ -1,7 +1,7 @@
 use crate::domain::{BackendKind, CockpitEvent, EventKind, PermissionPosture};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde_json::Value;
-use std::{env, fs, process::Command};
+use std::{env, fs, path::PathBuf, process::Command};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reported<T> {
@@ -96,6 +96,60 @@ pub fn hermes_snapshot(command_exists: bool) -> RuntimeSnapshot {
     }
 }
 
+pub fn hermes_quick_snapshot(command_exists: bool) -> RuntimeSnapshot {
+    if !command_exists {
+        return RuntimeSnapshot::missing("hermes");
+    }
+
+    let config_text = hermes_config_text();
+    RuntimeSnapshot {
+        backend: BackendKind::Hermes,
+        backend_label: "HERMES".to_string(),
+        reachable: true,
+        model_label: model_from_hermes_config(config_text.as_deref()),
+        voice_label: voice_from_hermes_config(config_text.as_deref()),
+        events: Reported::Unreported,
+        approvals: Reported::Unreported,
+        interrupt: Reported::Unreported,
+        pause_resume: Reported::Unreported,
+        sessions_list: Reported::Unreported,
+        transcript: Reported::Unreported,
+        wake_available: Reported::Unreported,
+        permission_posture: PermissionPosture::ObserveNotify,
+        log_events: vec![],
+        notes: vec![
+            "Hermes command detected; live status refresh is running in the background".to_string(),
+        ],
+    }
+}
+
+pub fn openclaw_quick_snapshot(command_exists: bool) -> RuntimeSnapshot {
+    if !command_exists {
+        return RuntimeSnapshot::missing("openclaw");
+    }
+
+    RuntimeSnapshot {
+        backend: BackendKind::OpenClaw,
+        backend_label: "OPENCLAW".to_string(),
+        reachable: true,
+        model_label: Reported::Unreported,
+        voice_label: Reported::Unreported,
+        events: Reported::Unreported,
+        approvals: Reported::Unreported,
+        interrupt: Reported::Unreported,
+        pause_resume: Reported::Unreported,
+        sessions_list: Reported::Unreported,
+        transcript: Reported::Unreported,
+        wake_available: Reported::Unreported,
+        permission_posture: PermissionPosture::ObserveNotify,
+        log_events: vec![],
+        notes: vec![
+            "OpenClaw command detected; live status refresh is running in the background"
+                .to_string(),
+        ],
+    }
+}
+
 pub fn openclaw_snapshot(command_exists: bool) -> RuntimeSnapshot {
     if !command_exists {
         return RuntimeSnapshot::missing("openclaw");
@@ -136,25 +190,39 @@ pub fn openclaw_snapshot(command_exists: bool) -> RuntimeSnapshot {
 /// Read recent Hermes agent log output via `hermes logs agent --since 15m --lines 30`.
 /// Hermes agent.log captures all agent activity: API calls, tool dispatch, session lifecycle.
 pub fn read_hermes_log_events() -> Vec<CockpitEvent> {
-    let output = match Command::new("hermes")
-        .args(["logs", "agent", "--since", "15m", "--lines", "30"])
-        .output()
-    {
-        Ok(output) if output.status.success() => output,
-        _ => return vec![],
-    };
-    let text = match String::from_utf8(output.stdout) {
-        Ok(text) => text,
-        Err(_) => return vec![],
-    };
+    let text = hermes_agent_log_text().unwrap_or_default();
     let mut events: Vec<CockpitEvent> = vec![];
-    for line in text.lines() {
+    let cutoff = Utc::now() - ChronoDuration::minutes(15);
+    for line in text
+        .lines()
+        .rev()
+        .take(200)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
         if let Some(event) = parse_hermes_log_line(line) {
+            if event.at < cutoff {
+                continue;
+            }
             events.push(event);
         }
     }
     keep_recent_events(&mut events, 12);
     events
+}
+
+fn hermes_agent_log_text() -> Option<String> {
+    let mut candidates = Vec::new();
+    if let Some(home) = env::var_os("HERMES_HOME") {
+        candidates.push(PathBuf::from(home).join("logs/agent.log"));
+    }
+    if let Some(home) = env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join(".hermes/logs/agent.log"));
+    }
+    candidates
+        .into_iter()
+        .find_map(|path| fs::read_to_string(path).ok())
 }
 
 /// Parse a single Hermes log line into a CockpitEvent.
@@ -457,6 +525,30 @@ fn model_from_backend(
         .filter(|value| !value.trim().is_empty())
         .map(|value| Reported::Value(value.trim().to_string()))
         .unwrap_or(Reported::Unreported)
+}
+
+fn model_from_hermes_config(config_text: Option<&str>) -> Reported<String> {
+    if let Ok(model) = env::var("HERMES_INFERENCE_MODEL")
+        && !model.trim().is_empty()
+    {
+        return Reported::Value(model.trim().to_string());
+    }
+
+    let Some(text) = config_text else {
+        return Reported::Unreported;
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some((label, value)) = trimmed.split_once(':')
+            && label.trim() == "model"
+        {
+            let model = value.trim().trim_matches(['\'', '"']);
+            if !model.is_empty() {
+                return Reported::Value(model.to_string());
+            }
+        }
+    }
+    Reported::Unreported
 }
 
 fn model_from_log_events(events: &[CockpitEvent]) -> Option<String> {
