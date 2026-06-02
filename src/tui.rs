@@ -88,8 +88,8 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
                 ),
                 KeyCode::Char('m') => push_operator_event(
                     &mut state,
-                    EventKind::Warning,
-                    "mute requested; voice input is currently keyboard-only",
+                    EventKind::Listening,
+                    "voice status requested; use :/voice, :/tts, or :/stt to route through backend",
                 ),
                 _ => {}
             }
@@ -111,6 +111,13 @@ enum CommandAction {
     Quit,
 }
 
+impl CommandAction {
+    #[cfg(test)]
+    fn is_continue(&self) -> bool {
+        matches!(self, Self::Continue)
+    }
+}
+
 fn handle_command(
     state: &mut CockpitState,
     args: &TuiArgs,
@@ -128,7 +135,8 @@ fn handle_command(
         }
         "help" | "h" | "?" => {
             overlay.message =
-                "keys: q quit · s refresh · i interrupt note · m mute note · : command".to_string();
+                "keys: q quit · s refresh · i interrupt note · m voice status · : /voice or prompt"
+                    .to_string();
             Ok(CommandAction::Continue)
         }
         "" => {
@@ -136,10 +144,32 @@ fn handle_command(
             Ok(CommandAction::Continue)
         }
         other => {
-            overlay.message = format!("unknown command: {other}");
+            route_backend_prompt(state, args, overlay, other);
             Ok(CommandAction::Continue)
         }
     }
+}
+
+fn route_backend_prompt(
+    state: &mut CockpitState,
+    args: &TuiArgs,
+    overlay: &mut UiOverlay,
+    prompt: &str,
+) {
+    overlay.message = format!("routing to backend: {}", compact(prompt, 32));
+    let result = backend::adapter_for(args.backend).route_prompt(prompt);
+    let kind = if result.ok {
+        EventKind::ResponseStream
+    } else {
+        EventKind::Warning
+    };
+    let label = format!("backend: {}", compact(&result.summary, 120));
+    push_operator_event(state, kind, &label);
+    overlay.message = if result.ok {
+        format!("backend replied: {}", compact(&result.summary, 48))
+    } else {
+        format!("backend failed: {}", compact(&result.summary, 48))
+    };
 }
 
 fn push_operator_event(state: &mut CockpitState, kind: EventKind, label: &str) {
@@ -476,5 +506,28 @@ mod tests {
         assert!(output.contains("APPROVAL"));
         assert!(output.contains("ACTIVITY LOG"));
         assert!(output.contains("BACKEND:"));
+    }
+
+    #[test]
+    fn command_mode_routes_slash_prompts_to_backend() {
+        let args = TuiArgs {
+            backend: crate::cli::BackendChoice::Fake,
+            ..Default::default()
+        };
+        let mut state = CockpitState::fake_listening();
+        let mut overlay = UiOverlay {
+            command_mode: true,
+            command: "/voice".to_string(),
+            message: String::new(),
+        };
+
+        let action = handle_command(&mut state, &args, &mut overlay).expect("command routes");
+
+        assert!(action.is_continue());
+        assert!(overlay.message.contains("backend replied"));
+        assert!(state.events.iter().any(|event| {
+            event.kind == EventKind::ResponseStream
+                && event.label.contains("fixture backend received: /voice")
+        }));
     }
 }
