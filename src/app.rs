@@ -15,6 +15,7 @@ pub fn print_status(args: StatusArgs) -> Result<()> {
         println!("Avu status");
         println!("Backend: {}", state.backend_label);
         println!("Model: {}", state.model_label);
+        println!("Voice: {}", state.voice_label);
         println!("Tools active: {}", state.tools_active);
         println!("Capabilities:");
         println!("  events: {}", state.capabilities.events);

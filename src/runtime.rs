@@ -1,7 +1,7 @@
 use crate::domain::{BackendKind, CockpitEvent, EventKind, PermissionPosture};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use std::process::Command;
+use std::{env, fs, process::Command};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reported<T> {
@@ -10,22 +10,13 @@ pub enum Reported<T> {
     Unavailable,
 }
 
-impl<T> Reported<T> {
-    pub fn as_ref(&self) -> Reported<&T> {
-        match self {
-            Self::Value(value) => Reported::Value(value),
-            Self::Unreported => Reported::Unreported,
-            Self::Unavailable => Reported::Unavailable,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSnapshot {
     pub backend: BackendKind,
     pub backend_label: String,
     pub reachable: bool,
     pub model_label: Reported<String>,
+    pub voice_label: Reported<String>,
     pub events: Reported<bool>,
     pub approvals: Reported<bool>,
     pub interrupt: Reported<bool>,
@@ -45,6 +36,7 @@ impl RuntimeSnapshot {
             backend_label: command.to_uppercase(),
             reachable: false,
             model_label: Reported::Unreported,
+            voice_label: Reported::Unreported,
             events: Reported::Unavailable,
             approvals: Reported::Unavailable,
             interrupt: Reported::Unavailable,
@@ -69,6 +61,7 @@ pub fn hermes_snapshot(command_exists: bool) -> RuntimeSnapshot {
     let configured_model = command_text("hermes", &["config", "get", "model"]);
     let reachable = status.is_some() || status_text.is_some();
     let log_events = read_hermes_log_events();
+    let config_text = hermes_config_text();
     let mut notes =
         vec!["Hermes command detected; events sourced from hermes logs agent".to_string()];
     if status.is_none() {
@@ -85,7 +78,9 @@ pub fn hermes_snapshot(command_exists: bool) -> RuntimeSnapshot {
             &status,
             status_text.as_deref(),
             configured_model.as_deref(),
+            &log_events,
         ),
+        voice_label: voice_from_hermes_config(config_text.as_deref()),
         events: json_bool(&status, &["events", "capabilities.events"]),
         approvals: json_bool(&status, &["approvals", "capabilities.approvals"]),
         interrupt: json_bool(&status, &["interrupt", "capabilities.interrupt"]),
@@ -121,7 +116,8 @@ pub fn openclaw_snapshot(command_exists: bool) -> RuntimeSnapshot {
         backend: BackendKind::OpenClaw,
         backend_label: "OPENCLAW".to_string(),
         reachable,
-        model_label: model_from_backend(&status, None, None),
+        model_label: model_from_backend(&status, None, None, &log_events),
+        voice_label: Reported::Unreported,
         events: json_bool(&gateway, &["events", "capabilities.events"]),
         approvals: json_bool(&gateway, &["approvals", "capabilities.approvals"]),
         interrupt: json_bool(&gateway, &["interrupt", "capabilities.interrupt"]),
@@ -189,7 +185,36 @@ fn parse_hermes_log_line(line: &str) -> Option<CockpitEvent> {
 
     let lower = rest.to_lowercase();
 
-    if lower.contains("tool")
+    if lower.contains("voice recording")
+        || lower.contains("recording started")
+        || lower.contains("listening")
+        || lower.contains("awaiting audio")
+    {
+        Some(CockpitEvent {
+            at,
+            kind: EventKind::Listening,
+            label: rest.to_string(),
+        })
+    } else if lower.contains("transcrib")
+        || lower.contains("stt")
+        || lower.contains("speech-to-text")
+    {
+        Some(CockpitEvent {
+            at,
+            kind: EventKind::Processing,
+            label: rest.to_string(),
+        })
+    } else if lower.contains("text-to-speech")
+        || lower.contains("tts")
+        || lower.contains("speaking")
+        || lower.contains("audio playback")
+    {
+        Some(CockpitEvent {
+            at,
+            kind: EventKind::Speaking,
+            label: rest.to_string(),
+        })
+    } else if lower.contains("tool")
         && (lower.contains("dispatch") || lower.contains("start") || lower.contains("call"))
     {
         Some(CockpitEvent {
@@ -223,7 +248,7 @@ fn parse_hermes_log_line(line: &str) -> Option<CockpitEvent> {
             kind: EventKind::Warning,
             label: rest.to_string(),
         })
-    } else if lower.contains("listening") || lower.contains("awaiting") {
+    } else if lower.contains("awaiting") {
         Some(CockpitEvent {
             at,
             kind: EventKind::Listening,
@@ -387,7 +412,11 @@ fn model_from_backend(
     status: &Option<Value>,
     status_text: Option<&str>,
     config_model: Option<&str>,
+    log_events: &[CockpitEvent],
 ) -> Reported<String> {
+    if let Some(model) = model_from_log_events(log_events) {
+        return Reported::Value(model);
+    }
     let from_status = json_string(
         status,
         &[
@@ -415,6 +444,28 @@ fn model_from_backend(
         .unwrap_or(Reported::Unreported)
 }
 
+fn model_from_log_events(events: &[CockpitEvent]) -> Option<String> {
+    for event in events {
+        if let Some(model) = value_after_key(&event.label, "model=") {
+            return Some(model);
+        }
+        if let Some(model) = value_after_key(&event.label, "model:") {
+            return Some(model);
+        }
+    }
+    None
+}
+
+fn value_after_key(input: &str, key: &str) -> Option<String> {
+    let start = input.find(key)? + key.len();
+    let value = input[start..]
+        .split_whitespace()
+        .next()?
+        .trim_matches(|ch: char| ch == ',' || ch == ';' || ch == ')' || ch == '"' || ch == '\'')
+        .to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
 fn model_from_status_text(status_text: Option<&str>) -> Option<String> {
     let text = status_text?;
     for line in text.lines() {
@@ -431,6 +482,117 @@ fn model_from_status_text(status_text: Option<&str>) -> Option<String> {
     None
 }
 
+fn hermes_config_text() -> Option<String> {
+    let home = env::var_os("HOME")?;
+    let path = std::path::PathBuf::from(home).join(".hermes/config.yaml");
+    fs::read_to_string(path).ok()
+}
+
+fn voice_from_hermes_config(config_text: Option<&str>) -> Reported<String> {
+    let Some(text) = config_text else {
+        return Reported::Unreported;
+    };
+    let stt_enabled =
+        yaml_section_value(text, "stt", "enabled").unwrap_or_else(|| "true".to_string());
+    let stt_provider =
+        yaml_section_value(text, "stt", "provider").unwrap_or_else(|| "auto".to_string());
+    let tts_provider =
+        yaml_section_value(text, "tts", "provider").unwrap_or_else(|| "auto".to_string());
+    let tts_voice = yaml_nested_value(text, "tts", &tts_provider, "voice")
+        .or_else(|| yaml_nested_value(text, "tts", &tts_provider, "voice_id"));
+    let tts_model = yaml_nested_value(text, "tts", &tts_provider, "model")
+        .or_else(|| yaml_nested_value(text, "tts", &tts_provider, "model_id"));
+    let record_key =
+        yaml_section_value(text, "voice", "record_key").unwrap_or_else(|| "ctrl+b".to_string());
+    let auto_tts =
+        yaml_section_value(text, "voice", "auto_tts").unwrap_or_else(|| "false".to_string());
+
+    let mut parts = vec![format!("STT {}", bool_prefix(&stt_enabled, &stt_provider))];
+    let mut tts = format!("TTS {tts_provider}");
+    if let Some(voice) = tts_voice {
+        tts.push('/');
+        tts.push_str(&voice);
+    } else if let Some(model) = tts_model {
+        tts.push('/');
+        tts.push_str(&model);
+    }
+    parts.push(tts);
+    parts.push(format!("key {record_key}"));
+    if auto_tts.eq_ignore_ascii_case("true") {
+        parts.push("auto-tts".to_string());
+    }
+    Reported::Value(parts.join(" · "))
+}
+
+fn bool_prefix(enabled: &str, provider: &str) -> String {
+    if enabled.eq_ignore_ascii_case("false") {
+        format!("off/{provider}")
+    } else {
+        provider.to_string()
+    }
+}
+
+fn yaml_section_value(text: &str, section: &str, key: &str) -> Option<String> {
+    let mut in_section = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !line.starts_with(' ') && trimmed.ends_with(':') {
+            in_section = trimmed.trim_end_matches(':') == section;
+            continue;
+        }
+        if in_section
+            && line.starts_with("  ")
+            && !line.starts_with("    ")
+            && let Some((candidate, value)) = trimmed.split_once(':')
+            && candidate.trim() == key
+        {
+            return clean_yaml_value(value);
+        }
+    }
+    None
+}
+
+fn yaml_nested_value(text: &str, section: &str, nested: &str, key: &str) -> Option<String> {
+    let mut in_section = false;
+    let mut in_nested = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !line.starts_with(' ') && trimmed.ends_with(':') {
+            in_section = trimmed.trim_end_matches(':') == section;
+            in_nested = false;
+            continue;
+        }
+        if in_section && line.starts_with("  ") && !line.starts_with("    ") {
+            in_nested = trimmed.trim_end_matches(':') == nested;
+            continue;
+        }
+        if in_section
+            && in_nested
+            && line.starts_with("    ")
+            && let Some((candidate, value)) = trimmed.split_once(':')
+            && candidate.trim() == key
+        {
+            return clean_yaml_value(value);
+        }
+    }
+    None
+}
+
+fn clean_yaml_value(value: &str) -> Option<String> {
+    let value = value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,8 +607,21 @@ mod tests {
     fn model_comes_from_backend_status_before_config_fallback() {
         let status = Some(serde_json::json!({ "model": { "model": "gpt-5.4" } }));
         assert_eq!(
-            model_from_backend(&status, None, Some("fallback-model")),
+            model_from_backend(&status, None, Some("fallback-model"), &[]),
             Reported::Value("gpt-5.4".to_string())
+        );
+    }
+
+    #[test]
+    fn model_prefers_recent_log_activity() {
+        let status = Some(serde_json::json!({ "model": { "model": "old-default" } }));
+        let events = vec![CockpitEvent::now(
+            EventKind::Processing,
+            "conversation turn: model=gemini-3.1-flash-lite-preview provider=gemini",
+        )];
+        assert_eq!(
+            model_from_backend(&status, None, None, &events),
+            Reported::Value("gemini-3.1-flash-lite-preview".to_string())
         );
     }
 
@@ -458,7 +633,7 @@ mod tests {
   Provider:     OpenRouter
 "#;
         assert_eq!(
-            model_from_backend(&None, Some(status_text), None),
+            model_from_backend(&None, Some(status_text), None, &[]),
             Reported::Value("openrouter/owl-alpha".to_string())
         );
     }
@@ -466,8 +641,29 @@ mod tests {
     #[test]
     fn model_can_fall_back_to_backend_config_command() {
         assert_eq!(
-            model_from_backend(&None, None, Some("claude-sonnet")),
+            model_from_backend(&None, None, Some("claude-sonnet"), &[]),
             Reported::Value("claude-sonnet".to_string())
+        );
+    }
+
+    #[test]
+    fn voice_label_comes_from_hermes_config() {
+        let config = r#"
+tts:
+  provider: gemini
+  gemini:
+    model: gemini-2.5-flash-preview-tts
+    voice: Kore
+stt:
+  enabled: true
+  provider: groq
+voice:
+  record_key: ctrl+b
+  auto_tts: false
+"#;
+        assert_eq!(
+            voice_from_hermes_config(Some(config)),
+            Reported::Value("STT groq · TTS gemini/Kore · key ctrl+b".to_string())
         );
     }
 
@@ -478,6 +674,28 @@ mod tests {
         assert!(event.is_some());
         assert_eq!(event.as_ref().unwrap().kind, EventKind::ToolStart);
         assert!(event.unwrap().label.contains("web.search"));
+    }
+
+    #[test]
+    fn parses_hermes_voice_recording_as_listening() {
+        let line = "2026-06-01 17:33:44,018 INFO tools.voice_mode: Voice recording started (rate=16000, channels=1)";
+        let event = parse_hermes_log_line(line);
+        assert_eq!(event.as_ref().unwrap().kind, EventKind::Listening);
+    }
+
+    #[test]
+    fn parses_hermes_stt_as_processing() {
+        let line =
+            "2026-06-01 17:33:44,018 INFO tools.voice_mode: STT transcribing audio with groq";
+        let event = parse_hermes_log_line(line);
+        assert_eq!(event.as_ref().unwrap().kind, EventKind::Processing);
+    }
+
+    #[test]
+    fn parses_hermes_tts_as_speaking() {
+        let line = "2026-06-01 17:33:44,018 INFO tools.voice_mode: TTS audio playback started with gemini voice Kore";
+        let event = parse_hermes_log_line(line);
+        assert_eq!(event.as_ref().unwrap().kind, EventKind::Speaking);
     }
 
     #[test]

@@ -83,6 +83,7 @@ fn hermes_status_does_not_show_fake_approval_when_unavailable() {
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("Model: unreported"))
+        .stdout(predicate::str::contains("Voice: unreported"))
         .stdout(predicate::str::contains("Pending approval").not())
         .stdout(predicate::str::contains("rm -rf build-cache").not())
         .stdout(predicate::str::contains("tool:web.search").not());
@@ -95,6 +96,7 @@ fn openclaw_status_does_not_show_fake_approval_when_unavailable() {
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("Model: unreported"))
+        .stdout(predicate::str::contains("Voice: unreported"))
         .stdout(predicate::str::contains("Pending approval").not())
         .stdout(predicate::str::contains("rm -rf build-cache").not())
         .stdout(predicate::str::contains("tool:web.search").not());
@@ -107,6 +109,7 @@ fn auto_status_without_backends_does_not_use_fake_fixture_state() {
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("Model: unreported"))
+        .stdout(predicate::str::contains("Voice: unreported"))
         .stdout(predicate::str::contains("Pending approval").not())
         .stdout(predicate::str::contains("rm -rf build-cache").not())
         .stdout(predicate::str::contains("tool:web.search").not());

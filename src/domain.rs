@@ -249,12 +249,7 @@ impl CockpitState {
             backend: snapshot.backend.clone(),
             backend_label: snapshot.backend_label.clone(),
             model_label: reported_string(snapshot.model_label.clone()),
-            voice_label: reported_bool(
-                snapshot.wake_available.as_ref(),
-                "WAKE",
-                "KEYBOARD",
-                "unreported",
-            ),
+            voice_label: reported_string(snapshot.voice_label.clone()),
             tools_active: 0,
             capabilities,
             events,
@@ -273,15 +268,6 @@ fn reported_string(value: Reported<String>) -> String {
 
 fn reported_bool_value(value: &Reported<bool>) -> bool {
     matches!(value, Reported::Value(true))
-}
-
-fn reported_bool(value: Reported<&bool>, yes: &str, no: &str, unknown: &str) -> String {
-    match value {
-        Reported::Value(true) => yes.to_string(),
-        Reported::Value(false) => no.to_string(),
-        Reported::Unavailable => "unavailable".to_string(),
-        Reported::Unreported => unknown.to_string(),
-    }
 }
 
 #[cfg(test)]
