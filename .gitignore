@@ -109,14 +109,6 @@ logs/
 2026-05-31-termdeck-deep-research.md
 hermes_voice_tui_research_report.md
 docs/
-!docs/
-docs/*
-!docs/superpowers/
-docs/superpowers/*
-!docs/superpowers/specs/
-!docs/superpowers/specs/**
-!docs/superpowers/plans/
-!docs/superpowers/plans/**
 
 # -----------------------------------------------------------------------------
 # Design assets / screenshots (large binary files)
