@@ -92,18 +92,12 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
                     } else {
                         EventKind::Warning
                     };
-                    let label = format!("backend: {}", compact(&cmd_result.summary, 120));
+                    let label = format!("backend: {}", cmd_result.summary);
                     push_operator_event(&mut state, kind, &label, &mut session_log);
                     overlay.message = if cmd_result.ok {
-                        format!(
-                            "backend replied: {}",
-                            compact(&cmd_result.summary, 48)
-                        )
+                        format!("backend replied: {}", compact(&cmd_result.summary, 48))
                     } else {
-                        format!(
-                            "backend failed: {}",
-                            compact(&cmd_result.summary, 48)
-                        )
+                        format!("backend failed: {}", compact(&cmd_result.summary, 48))
                     };
                     if !refresh_inflight {
                         spawn_refresh(&args, &refresh_tx);
@@ -112,12 +106,7 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
                     }
                 }
                 Err(error) => {
-                    push_operator_event(
-                        &mut state,
-                        EventKind::Warning,
-                        &error,
-                        &mut session_log,
-                    );
+                    push_operator_event(&mut state, EventKind::Warning, &error, &mut session_log);
                     overlay.message = format!("backend error: {}", compact(&error, 48));
                 }
             }
@@ -186,18 +175,28 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
                     last_refresh = Instant::now();
                     overlay.message = "refreshing backend status...".to_string();
                 }
-                KeyCode::Char('i') => push_operator_event(
-                    &mut state,
-                    EventKind::Warning,
-                    "interrupt requested; backend control routing not enabled yet",
-                    &mut session_log,
-                ),
-                KeyCode::Char('m') => push_operator_event(
-                    &mut state,
-                    EventKind::Listening,
-                    "voice status requested; use :/voice, :/tts, or :/stt to route through backend",
-                    &mut session_log,
-                ),
+                KeyCode::Up if !overlay.is_typing() => {
+                    overlay.activity_scroll = overlay.activity_scroll.saturating_add(1);
+                }
+                KeyCode::Down if !overlay.is_typing() => {
+                    overlay.activity_scroll = overlay.activity_scroll.saturating_sub(1);
+                }
+                KeyCode::Char('i') => {
+                    push_operator_event(
+                        &mut state,
+                        EventKind::Warning,
+                        "interrupt requested; backend control routing not enabled yet",
+                        &mut session_log,
+                    );
+                }
+                KeyCode::Char('m') => {
+                    push_operator_event(
+                        &mut state,
+                        EventKind::Listening,
+                        "voice status requested; use :/voice, :/tts, or :/stt to route through backend",
+                        &mut session_log,
+                    );
+                }
                 _ => {}
             }
         }
@@ -224,6 +223,7 @@ struct UiOverlay {
     input_mode: Option<InputMode>,
     input: String,
     message: String,
+    activity_scroll: usize,
 }
 
 impl UiOverlay {
@@ -262,9 +262,15 @@ fn handle_input_key(
 ) -> Result<CommandAction> {
     match overlay.input_mode {
         Some(InputMode::Picker) => handle_picker_key(state, args, overlay, key_code),
-        Some(InputMode::Command) | Some(InputMode::Chat) => {
-            handle_text_input_key(state, args, overlay, key_code, prompt_tx, prompt_inflight, session_log)
-        }
+        Some(InputMode::Command) | Some(InputMode::Chat) => handle_text_input_key(
+            state,
+            args,
+            overlay,
+            key_code,
+            prompt_tx,
+            prompt_inflight,
+            session_log,
+        ),
         None => Ok(CommandAction::Continue),
     }
 }
@@ -322,11 +328,22 @@ fn handle_text_input_key(
         }
         KeyCode::Enter => match overlay.input_mode {
             Some(InputMode::Command) => run_shell_input(state, overlay, session_log),
-            Some(InputMode::Chat) => {
-                route_chat_input(state, args, overlay, prompt_tx, prompt_inflight, session_log)
-            }
+            Some(InputMode::Chat) => route_chat_input(
+                state,
+                args,
+                overlay,
+                prompt_tx,
+                prompt_inflight,
+                session_log,
+            ),
             _ => {}
         },
+        KeyCode::PageUp => {
+            overlay.activity_scroll = overlay.activity_scroll.saturating_add(1);
+        }
+        KeyCode::PageDown => {
+            overlay.activity_scroll = overlay.activity_scroll.saturating_sub(1);
+        }
         KeyCode::Backspace | KeyCode::Delete => {
             overlay.input.pop();
         }
@@ -342,7 +359,6 @@ fn run_shell_input(
     session_log: &mut Option<fs::File>,
 ) {
     let command = overlay.input.trim().to_string();
-    overlay.input_mode = None;
     overlay.input.clear();
     let result = backend::run_shell_command(&command);
     let kind = if result.ok {
@@ -368,9 +384,8 @@ fn route_chat_input(
     session_log: &mut Option<fs::File>,
 ) {
     let prompt = overlay.input.trim().to_string();
-    overlay.input_mode = None;
-    overlay.input.clear();
     if prompt.is_empty() {
+        overlay.input.clear();
         overlay.message = "empty prompt, cancelled".to_string();
         return;
     }
@@ -379,6 +394,7 @@ fn route_chat_input(
             "already waiting for backend; wait for response or restart Avu".to_string();
         return;
     }
+    overlay.input.clear();
     push_operator_event(
         state,
         EventKind::Processing,
@@ -580,7 +596,7 @@ fn render_with_overlay(
             .constraints([Constraint::Min(14), Constraint::Length(12)])
             .split(vertical[0]);
         render_core(frame, stack[0], state);
-        render_activity(frame, stack[1], state);
+        render_activity(frame, stack[1], state, overlay);
     } else {
         let main = Layout::default()
             .direction(Direction::Horizontal)
@@ -588,7 +604,7 @@ fn render_with_overlay(
             .split(vertical[0]);
 
         render_core(frame, main[0], state);
-        render_activity(frame, main[1], state);
+        render_activity(frame, main[1], state, overlay);
     }
     render_footer(frame, vertical[1], state, overlay);
 }
@@ -728,12 +744,23 @@ fn compact(input: &str, max_chars: usize) -> String {
     output
 }
 
-fn render_activity(frame: &mut ratatui::Frame<'_>, area: Rect, state: &CockpitState) {
-    let items: Vec<ListItem<'_>> = state
-        .events
-        .iter()
+fn render_activity(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    state: &CockpitState,
+    overlay: Option<&UiOverlay>,
+) {
+    let mut events: Vec<&CockpitEvent> = state.events.iter().rev().take(12).collect();
+    let scroll = overlay
+        .map(|overlay| overlay.activity_scroll)
+        .unwrap_or_default();
+    if scroll > 0 && events.len() > scroll {
+        events.drain(0..scroll);
+    }
+
+    let items: Vec<ListItem<'_>> = events
+        .into_iter()
         .rev()
-        .take(12)
         .map(|event| {
             let color = match event.kind {
                 EventKind::ToolStart | EventKind::ToolFinish => Color::Yellow,
@@ -741,22 +768,62 @@ fn render_activity(frame: &mut ratatui::Frame<'_>, area: Rect, state: &CockpitSt
                 EventKind::Error => Color::Red,
                 _ => Color::Cyan,
             };
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    event.at.format("[%H:%M:%S] ").to_string(),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(event.label.clone(), Style::default().fg(color)),
-            ]))
+            let wrapped_lines: Vec<String> = event
+                .label
+                .lines()
+                .flat_map(|line| {
+                    let max_width = usize::from(area.width.saturating_sub(12)).max(1);
+                    if line.chars().count() <= max_width {
+                        vec![line.to_string()]
+                    } else {
+                        line.chars()
+                            .collect::<Vec<_>>()
+                            .chunks(max_width)
+                            .map(|chunk| chunk.iter().collect())
+                            .collect()
+                    }
+                })
+                .collect();
+
+            let mut item_lines = Vec::new();
+            if let Some(first_line) = wrapped_lines.first() {
+                item_lines.push(Line::from(vec![
+                    Span::styled(
+                        event.at.format("[%H:%M:%S] ").to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(first_line.clone(), Style::default().fg(color)),
+                ]));
+                item_lines.extend(
+                    wrapped_lines
+                        .into_iter()
+                        .skip(1)
+                        .map(|line| Line::from(Span::styled(line, Style::default().fg(color)))),
+                );
+            } else {
+                item_lines.push(Line::from(vec![
+                    Span::styled(
+                        event.at.format("[%H:%M:%S] ").to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(String::new(), Style::default().fg(color)),
+                ]));
+            }
+
+            ListItem::new(item_lines)
         })
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .title(" ACTIVITY LOG ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(" ACTIVITY LOG ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_symbol(">>")
+        .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
+
     frame.render_widget(list, area);
 }
 
@@ -845,6 +912,21 @@ mod tests {
     }
 
     #[test]
+    fn activity_log_wraps_long_backend_messages() {
+        let mut state = CockpitState::fake_listening();
+        state.events.clear();
+        state.events.push(CockpitEvent {
+            at: chrono::Utc::now(),
+            kind: EventKind::ResponseStream,
+            label: "backend: long reply with enough content to wrap across rows and still show tail-marker".to_string(),
+        });
+
+        let output = render_to_string(&state, 100, 32).expect("render should succeed");
+
+        assert!(output.contains("tail-marker"));
+    }
+
+    #[test]
     fn command_mode_routes_slash_prompts_to_backend() {
         let args = TuiArgs {
             backend: crate::cli::BackendChoice::Fake,
@@ -855,6 +937,7 @@ mod tests {
             input_mode: Some(InputMode::Chat),
             input: "/voice".to_string(),
             message: String::new(),
+            activity_scroll: 0,
         };
         let (prompt_tx, _prompt_rx) = mpsc::channel();
         let mut prompt_inflight = false;
@@ -872,11 +955,12 @@ mod tests {
         .expect("command routes");
 
         assert!(action.is_continue());
+        assert_eq!(overlay.input_mode, Some(InputMode::Chat));
+        assert!(overlay.input.is_empty());
         assert!(overlay.message.contains("sending to backend"));
         assert!(prompt_inflight);
         assert!(state.events.iter().any(|event| {
-            event.kind == EventKind::Processing
-                && event.label.contains("sending: /voice")
+            event.kind == EventKind::Processing && event.label.contains("sending: /voice")
         }));
     }
 
@@ -888,6 +972,7 @@ mod tests {
             input_mode: Some(InputMode::Picker),
             input: String::new(),
             message: String::new(),
+            activity_scroll: 0,
         };
         let (prompt_tx, _prompt_rx) = mpsc::channel();
         let mut prompt_inflight = false;
@@ -927,6 +1012,7 @@ mod tests {
             input_mode: Some(InputMode::Chat),
             input: "hello".to_string(),
             message: String::new(),
+            activity_scroll: 0,
         };
         let (prompt_tx, _prompt_rx) = mpsc::channel();
         let mut prompt_inflight = false;
@@ -957,6 +1043,77 @@ mod tests {
     }
 
     #[test]
+    fn chat_preserves_next_message_while_backend_is_busy() {
+        let args = TuiArgs {
+            backend: crate::cli::BackendChoice::Fake,
+            ..Default::default()
+        };
+        let mut state = CockpitState::fake_listening();
+        let mut overlay = UiOverlay {
+            input_mode: Some(InputMode::Chat),
+            input: "next message".to_string(),
+            message: String::new(),
+            activity_scroll: 0,
+        };
+        let (prompt_tx, _prompt_rx) = mpsc::channel();
+        let mut prompt_inflight = true;
+        let mut session_log = None;
+
+        handle_input_key(
+            &mut state,
+            &args,
+            &mut overlay,
+            KeyCode::Enter,
+            &prompt_tx,
+            &mut prompt_inflight,
+            &mut session_log,
+        )
+        .expect("busy backend keeps draft");
+
+        assert_eq!(overlay.input, "next message");
+        assert!(overlay.message.contains("already waiting"));
+    }
+
+    #[test]
+    fn input_mode_can_scroll_activity_log() {
+        let args = TuiArgs::default();
+        let mut state = CockpitState::fake_listening();
+        let mut overlay = UiOverlay {
+            input_mode: Some(InputMode::Chat),
+            input: String::new(),
+            message: String::new(),
+            activity_scroll: 0,
+        };
+        let (prompt_tx, _prompt_rx) = mpsc::channel();
+        let mut prompt_inflight = false;
+        let mut session_log = None;
+
+        handle_input_key(
+            &mut state,
+            &args,
+            &mut overlay,
+            KeyCode::PageUp,
+            &prompt_tx,
+            &mut prompt_inflight,
+            &mut session_log,
+        )
+        .expect("page up scrolls");
+        assert_eq!(overlay.activity_scroll, 1);
+
+        handle_input_key(
+            &mut state,
+            &args,
+            &mut overlay,
+            KeyCode::PageDown,
+            &prompt_tx,
+            &mut prompt_inflight,
+            &mut session_log,
+        )
+        .expect("page down scrolls");
+        assert_eq!(overlay.activity_scroll, 0);
+    }
+
+    #[test]
     fn refresh_preserves_operator_events() {
         let args = TuiArgs {
             backend: crate::cli::BackendChoice::Fake,
@@ -965,7 +1122,12 @@ mod tests {
         let mut state = CockpitState::fake_listening();
         state.events.clear();
         let mut session_log = None;
-        push_operator_event(&mut state, EventKind::ResponseStream, "cmd: printf avu", &mut session_log);
+        push_operator_event(
+            &mut state,
+            EventKind::ResponseStream,
+            "cmd: printf avu",
+            &mut session_log,
+        );
 
         refresh_state(&mut state, &args).expect("refresh keeps local activity");
 
