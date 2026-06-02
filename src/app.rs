@@ -23,6 +23,12 @@ pub fn print_status(args: StatusArgs) -> Result<()> {
         println!("  interrupt: {}", state.capabilities.interrupt);
         println!("  pause_resume: {}", state.capabilities.pause_resume);
         println!("  sessions_list: {}", state.capabilities.sessions_list);
+        if !state.capabilities.notes.is_empty() {
+            println!("Notes:");
+            for note in &state.capabilities.notes {
+                println!("  - {note}");
+            }
+        }
         if let Some(approval) = state.pending_approval {
             println!("Pending approval: {}", approval.summary);
             if let Some(command) = approval.command {

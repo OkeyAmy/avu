@@ -58,6 +58,7 @@ pub fn hermes_snapshot(command_exists: bool) -> RuntimeSnapshot {
 
     let status = command_json("hermes", &["status", "--json"]);
     let status_text = command_text("hermes", &["status"]);
+    let gateway_text = command_text("hermes", &["gateway", "status"]);
     let configured_model = command_text("hermes", &["config", "get", "model"]);
     let reachable = status.is_some() || status_text.is_some();
     let log_events = read_hermes_log_events();
@@ -69,6 +70,7 @@ pub fn hermes_snapshot(command_exists: bool) -> RuntimeSnapshot {
             "Hermes status JSON unavailable; capability detection is degraded until Hermes exposes machine-readable status".to_string(),
         );
     }
+    notes.extend(hermes_gateway_notes(gateway_text.as_deref()));
 
     RuntimeSnapshot {
         backend: BackendKind::Hermes,
@@ -482,6 +484,66 @@ fn model_from_status_text(status_text: Option<&str>) -> Option<String> {
     None
 }
 
+fn hermes_gateway_notes(gateway_text: Option<&str>) -> Vec<String> {
+    let Some(text) = gateway_text else {
+        return vec!["Hermes gateway status unavailable; run `hermes gateway status` to inspect messaging backends".to_string()];
+    };
+    let lower = text.to_lowercase();
+    let mut notes = Vec::new();
+    let auto_restarting = lower.contains("activating (auto-restart)")
+        || lower.contains("restart pending")
+        || lower.contains("auto-restart");
+    let stopped = lower.contains("user gateway service is stopped")
+        || lower.contains("active: inactive (dead)");
+    let running_profile = running_gateway_profile(text);
+
+    if lower.contains("telegram bot token already in use") {
+        let conflict = text
+            .lines()
+            .map(str::trim)
+            .find(|line| {
+                line.to_lowercase()
+                    .contains("telegram bot token already in use")
+            })
+            .unwrap_or("telegram bot token already in use");
+        if auto_restarting {
+            notes.push(format!("Hermes gateway conflict: {conflict}"));
+        } else {
+            notes.push(format!("Hermes gateway last startup issue: {conflict}"));
+        }
+        if let Some(profile) = running_profile.as_deref() {
+            notes.push(format!(
+                "Hermes gateway active profile: `{profile}` is running; use `hermes --profile {profile} gateway restart` to restart it, or keep default stopped unless default should own the Telegram token"
+            ));
+        } else {
+            notes.push("Hermes gateway repair: stop the process named in `hermes gateway status`, then run `hermes gateway restart`".to_string());
+        }
+    } else if stopped && let Some(profile) = running_profile.as_deref() {
+        notes.push(format!(
+            "Hermes gateway active profile: `{profile}` is running; default profile gateway is stopped"
+        ));
+    } else if lower.contains("user gateway service is running") {
+        notes.push("Hermes gateway service is running".to_string());
+    } else if lower.contains("user gateway service is stopped") {
+        notes.push("Hermes gateway service is stopped; run `hermes gateway start` if this profile should receive messages".to_string());
+    }
+
+    notes
+}
+
+fn running_gateway_profile(gateway_text: &str) -> Option<String> {
+    gateway_text.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let rest = trimmed.strip_prefix('✓')?.trim();
+        let profile = rest.split_whitespace().next()?;
+        if profile == "User" || profile == "Systemd" {
+            None
+        } else {
+            Some(profile.to_string())
+        }
+    })
+}
+
 fn hermes_config_text() -> Option<String> {
     let home = env::var_os("HOME")?;
     let path = std::path::PathBuf::from(home).join(".hermes/config.yaml");
@@ -665,6 +727,54 @@ voice:
             voice_from_hermes_config(Some(config)),
             Reported::Value("STT groq · TTS gemini/Kore · key ctrl+b".to_string())
         );
+    }
+
+    #[test]
+    fn gateway_notes_detect_profile_token_conflict() {
+        let status = r#"
+Active: activating (auto-restart) since Tue 2026-06-02 03:05:43 EDT
+✗ User gateway service is stopped
+Recent gateway health:
+  ⚠ telegram: Telegram bot token already in use (PID 741). Stop the other gateway first.
+  ⏳ Restart pending: systemd is waiting to relaunch the gateway
+Other profiles:
+  ✓ portal           — PID 741
+"#;
+        let notes = hermes_gateway_notes(Some(status));
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("Telegram bot token already in use"))
+        );
+        assert!(notes.iter().any(|note| {
+            note.contains("hermes --profile portal gateway restart")
+                && note.contains("active profile")
+        }));
+    }
+
+    #[test]
+    fn gateway_notes_treat_stopped_default_conflict_as_last_issue() {
+        let status = r#"
+Active: inactive (dead) since Tue 2026-06-02 03:14:56 EDT
+✗ User gateway service is stopped
+Recent gateway health:
+  ⚠ Last startup issue: telegram: Telegram bot token already in use (PID 741). Stop the other gateway first.
+Other profiles:
+  ✓ portal           — PID 115002
+"#;
+        let notes = hermes_gateway_notes(Some(status));
+        assert!(notes.iter().any(|note| note.contains("last startup issue")));
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("active profile: `portal`"))
+        );
+    }
+
+    #[test]
+    fn gateway_notes_detect_running_service() {
+        let notes = hermes_gateway_notes(Some("✓ User gateway service is running"));
+        assert_eq!(notes, vec!["Hermes gateway service is running".to_string()]);
     }
 
     #[test]
