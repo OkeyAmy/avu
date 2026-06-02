@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     thread,
     time::{Duration, SystemTime},
 };
@@ -150,6 +150,30 @@ pub fn adapter_for(choice: BackendChoice) -> Box<dyn BackendAdapter> {
     }
 }
 
+pub fn quick_cockpit_state(choice: BackendChoice) -> CockpitState {
+    match choice {
+        BackendChoice::Fake => FakeBackend.cockpit_state(),
+        BackendChoice::Hermes => {
+            CockpitState::from_runtime(runtime::hermes_quick_snapshot(command_exists("hermes")))
+        }
+        BackendChoice::Openclaw => {
+            CockpitState::from_runtime(runtime::openclaw_quick_snapshot(command_exists("openclaw")))
+        }
+        BackendChoice::Remote => {
+            CockpitState::from_runtime(runtime::RuntimeSnapshot::missing("backend"))
+        }
+        BackendChoice::Auto => {
+            if command_exists("hermes") {
+                CockpitState::from_runtime(runtime::hermes_quick_snapshot(true))
+            } else if command_exists("openclaw") {
+                CockpitState::from_runtime(runtime::openclaw_quick_snapshot(true))
+            } else {
+                CockpitState::from_runtime(runtime::RuntimeSnapshot::missing("backend"))
+            }
+        }
+    }
+}
+
 pub fn load_fixture(path: &Path) -> Result<CockpitState> {
     let data = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read fixture {}", path.display()))?;
@@ -175,12 +199,19 @@ fn run_backend_prompt(command: &str, prompt: &str) -> BackendCommandResult {
     let before_audio = latest_backend_audio(command);
 
     let result = match command {
-        "hermes" => run_command_prompt(command, &["--oneshot", prompt], before_audio.as_ref()),
+        "hermes" => run_command_prompt(
+            command,
+            &["--continue", "avu-tui", "--oneshot", prompt],
+            before_audio.as_ref(),
+        ),
         other => run_command_prompt(other, &[prompt], before_audio.as_ref()),
     };
 
     let after_audio = latest_backend_audio(command);
-    let new_audio = newer_audio(before_audio.as_ref(), after_audio.as_ref()).cloned();
+    let new_audio = result
+        .audio_path
+        .clone()
+        .or_else(|| newer_audio(before_audio.as_ref(), after_audio.as_ref()).cloned());
     let played = new_audio.as_ref().and_then(|path| play_audio(path));
     let result = result.with_audio(new_audio.clone());
 
@@ -227,6 +258,30 @@ pub fn run_shell_command(command: &str) -> BackendCommandResult {
     summarize_output(output)
 }
 
+pub fn run_voice_session(choice: BackendChoice) -> BackendCommandResult {
+    match adapter_for(choice).label() {
+        "hermes" => run_interactive_backend("hermes", &["--continue", "avu-tui", "--tui"]),
+        "openclaw" => {
+            BackendCommandResult::failed("OpenClaw voice handoff is not available through Avu yet")
+        }
+        _ => BackendCommandResult::failed("voice requires a live Hermes backend on PATH"),
+    }
+}
+
+fn run_interactive_backend(command: &str, args: &[&str]) -> BackendCommandResult {
+    if !command_exists(command) {
+        return BackendCommandResult::failed(format!("{command} command was not found on PATH"));
+    }
+
+    match Command::new(command).args(args).status() {
+        Ok(status) if status.success() => BackendCommandResult::ok("voice session ended"),
+        Ok(status) => BackendCommandResult::failed(format!("voice session exited with {status}")),
+        Err(error) => {
+            BackendCommandResult::failed(format!("failed to start voice session: {error}"))
+        }
+    }
+}
+
 fn run_command_prompt(
     command: &str,
     args: &[&str],
@@ -238,8 +293,8 @@ fn run_command_prompt(
 
     let mut child = match Command::new(command)
         .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
     {
         Ok(child) => child,
@@ -381,10 +436,20 @@ fn play_audio(path: &Path) -> Option<String> {
             continue;
         }
         let mut command = Command::new(program);
-        command.args(*args).arg(path);
-        match command.status() {
-            Ok(status) if status.success() => return Some(format!("played with {program}")),
-            Ok(_) => continue,
+        command
+            .args(*args)
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        match command.spawn() {
+            Ok(mut child) => {
+                let player = (*program).to_string();
+                thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Some(format!("started with {player}"));
+            }
             Err(_) => continue,
         }
     }
@@ -394,11 +459,18 @@ fn play_audio(path: &Path) -> Option<String> {
 fn summarize_output(output: std::process::Output) -> BackendCommandResult {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let summary = stdout
+    let lines: Vec<&str> = stdout
         .lines()
         .chain(stderr.lines())
         .map(str::trim)
-        .find(|line| !line.is_empty())
+        .filter(|line| !line.is_empty())
+        .collect();
+    let audio_path = lines.iter().find_map(|line| media_path_from_line(line));
+    let summary = lines
+        .iter()
+        .copied()
+        .find(|line| !line.starts_with("MEDIA:") && *line != "[[audio_as_voice]]")
+        .or_else(|| audio_path.as_ref().map(|_| "backend generated audio"))
         .unwrap_or(if output.status.success() {
             "backend command completed"
         } else {
@@ -407,10 +479,17 @@ fn summarize_output(output: std::process::Output) -> BackendCommandResult {
         .to_string();
 
     if output.status.success() {
-        BackendCommandResult::ok(summary)
+        BackendCommandResult::ok(summary).with_audio(audio_path)
     } else {
-        BackendCommandResult::failed(summary)
+        BackendCommandResult::failed(summary).with_audio(audio_path)
     }
+}
+
+fn media_path_from_line(line: &str) -> Option<PathBuf> {
+    line.strip_prefix("MEDIA:")
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
 }
 
 #[cfg(test)]
@@ -449,5 +528,32 @@ mod tests {
         };
         assert!(result.ok);
         assert_eq!(result.summary, "avu-cmd");
+    }
+
+    #[test]
+    fn summarize_output_extracts_backend_media_path() {
+        let output = std::process::Output {
+            status: success_status(),
+            stdout: b"[[audio_as_voice]]\nMEDIA:/tmp/avu-voice.ogg\n".to_vec(),
+            stderr: vec![],
+        };
+
+        let result = summarize_output(output);
+
+        assert!(result.ok);
+        assert_eq!(result.summary, "backend generated audio");
+        assert_eq!(result.audio_path, Some(PathBuf::from("/tmp/avu-voice.ogg")));
+    }
+
+    #[cfg(unix)]
+    fn success_status() -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(0)
+    }
+
+    #[cfg(windows)]
+    fn success_status() -> std::process::ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(0)
     }
 }
