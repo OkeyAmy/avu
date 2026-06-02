@@ -9,10 +9,10 @@ Avu is a Ratatui-based terminal UI that connects to [Hermes Agent](https://herme
 ## Features
 
 - **Live backend status** — reads from `hermes status`, `hermes gateway status`, `hermes logs`, `openclaw status`, `openclaw gateway status`, and `openclaw logs`.
-- **Interactive TUI** — Ratatui cockpit with live refresh (auto-refreshes every 2s).
+- **Interactive TUI** — Ratatui cockpit with fast startup and background live refresh.
 - **Dual input modes** — CMD mode for local shell commands, Chat mode for backend prompts.
 - **Approval routing** — surfaces pending approvals from the backend with safety gating.
-- **Voice awareness** — detects Hermes voice config (STT, TTS providers, record key) and auto-plays generated audio.
+- **Voice awareness** — detects Hermes voice config (STT, TTS providers, record key), auto-plays generated audio, and hands off to Hermes voice mode with `Ctrl+B`.
 - **Event radar** — visual HUD that maps backend log events to cockpit modes (LISTENING, PROCESSING, SPEAKING, TOOL ACTIVE, APPROVAL, etc.).
 - **Fixture mode** — test the TUI with pre-recorded fixture data without a live backend.
 - **Backend auto-detection** — discovers Hermes or OpenClaw on `PATH` and adapts automatically.
@@ -134,11 +134,12 @@ Once inside the cockpit (`avu tui`):
 | Key | Action |
 |-----|--------|
 | `:` | Open input picker |
-| `c` then `:` | Enter **CMD mode** — type a shell command, press Enter to run |
-| `t` then `:` | Enter **Chat mode** — type a message for the backend |
-| `/` then `:` | Enter **Chat mode** with `/` prefilled (backend slash commands) |
+| `:` then `c` | Enter **CMD mode** — type a shell command, press Enter to run |
+| `:` then `t` | Enter **Chat mode** — type a message for the backend |
+| `:` then `/` | Enter **Chat mode** with `/` prefilled (backend slash commands) |
 | `Enter` | Submit the current input |
 | `Backspace` / `Delete` | Delete last character |
+| `Ctrl+B` | Hand the terminal to Hermes interactive voice/TUI mode |
 | `Esc` | Cancel current input / quit when not typing |
 | `s` | Refresh backend status immediately |
 | `m` | Show voice command help in the activity log |
@@ -226,11 +227,11 @@ Avu reads from Hermes via:
 
 - `hermes status` / `hermes status --json` — model, provider, component state
 - `hermes gateway status` — gateway service health and profile conflicts
-- `hermes logs agent --since 15m --lines 30` — recent agent activity
+- `~/.hermes/logs/agent.log` — recent timestamped agent activity, filtered to the last 15 minutes
 - `~/.hermes/config.yaml` — STT, TTS, and voice settings
 - Audio cache: `$HERMES_AUDIO_CACHE_DIR`, `~/.hermes/audio_cache`, `~/.hermes/cache/audio`
 
-Chat input routes to Hermes via `hermes --oneshot <message>`. If TTS audio is generated, Avu tries to play it with an available local player.
+Chat input routes to Hermes via `hermes --continue avu-tui --oneshot <message>` so repeated messages stay in the same named Avu session instead of starting a fresh conversation each time. If TTS audio is generated, Avu uses explicit `MEDIA:` output when available, otherwise checks the audio cache, then starts an available local player without blocking the TUI.
 
 ### OpenClaw
 
@@ -252,7 +253,8 @@ Chat input routes via `openclaw agent --message <text>`. OpenClaw decides tool d
 1. Avu reads Hermes voice config from `~/.hermes/config.yaml` — STT provider, TTS provider, record key.
 2. The cockpit shows voice status in the footer bar (e.g., `STT groq · TTS gemini/Kore · key ctrl+b`).
 3. Use Chat mode to send voice commands: `/voice on`, `/tts say hello`, `/stt switch groq`.
-4. When Hermes generates an audio file in response, Avu detects it and plays it automatically.
+4. When Hermes generates an audio file in response, Avu detects it and starts playback automatically.
+5. For microphone recording, press `Ctrl+B` in Avu. Avu temporarily hands the terminal to Hermes' own interactive voice/TUI mode because Hermes owns raw push-to-talk, microphone capture, silence detection, STT, and spoken replies.
 
 ### Troubleshooting
 
@@ -262,8 +264,14 @@ Chat input routes via `openclaw agent --message <text>`. OpenClaw decides tool d
 3. Over SSH? Audio plays on the remote machine, not your local speakers.
 4. Use CMD mode for manual playback: `: c ffplay -nodisp -autoexit ~/.hermes/audio_cache/<file>.mp3`
 
+**Ctrl+B does not record?**
+- Press `Ctrl+B` in Avu to enter Hermes voice mode, then run `/voice on` inside Hermes if needed.
+- Press Hermes' configured record key inside Hermes (`voice.record_key`, commonly `ctrl+b`) and speak.
+- Exit Hermes to return to Avu.
+- If recording still fails, verify directly with `hermes --tui`; Avu does not hardcode or replace Hermes' STT recorder.
+
 **TUI stuck on IDLE?**
-- Run `avu status --backend hermes --json` and `hermes logs agent --lines 30`.
+- Run `avu status --backend hermes --json` and inspect `~/.hermes/logs/agent.log`.
 - Avu maps log events to cockpit modes — look for `voice recording`, `STT`, `TTS`, `tool`, `response` lines.
 
 **Gateway conflict?**
