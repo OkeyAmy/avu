@@ -3,7 +3,10 @@ use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
+    },
 };
 use ratatui::{
     Terminal,
@@ -15,8 +18,14 @@ use ratatui::{
 };
 use std::{
     io,
+    sync::mpsc,
+    thread,
     time::{Duration, Instant},
 };
+
+type RefreshResult = std::result::Result<CockpitState, String>;
+type RefreshSender = mpsc::Sender<RefreshResult>;
+type RefreshReceiver = mpsc::Receiver<RefreshResult>;
 
 pub fn run(args: TuiArgs) -> Result<()> {
     if args.once {
@@ -39,16 +48,35 @@ fn state_for_args(args: &TuiArgs) -> Result<CockpitState> {
 
 fn run_interactive(args: TuiArgs) -> Result<()> {
     let mut terminal = TerminalSession::start()?;
-    let mut state = state_for_args(&args)?;
+    let mut state = initial_state_for_args(&args)?;
     let mut overlay = UiOverlay::default();
     let mut last_refresh = Instant::now();
+    let (refresh_tx, refresh_rx): (RefreshSender, RefreshReceiver) = mpsc::channel();
+    let mut refresh_inflight = false;
 
     loop {
+        while let Ok(result) = refresh_rx.try_recv() {
+            refresh_inflight = false;
+            match result {
+                Ok(refreshed) => {
+                    apply_refreshed_state(&mut state, refreshed);
+                    overlay.message = "backend status refreshed".to_string();
+                }
+                Err(error) => {
+                    overlay.message = format!("backend refresh failed: {}", compact(&error, 48));
+                }
+            }
+        }
+
         engine::apply_projection(&mut state);
         terminal.draw(|frame| render_with_overlay(frame, &state, Some(&overlay)))?;
 
-        if last_refresh.elapsed() >= Duration::from_secs(2) && !overlay.is_typing() {
-            state = state_for_args(&args)?;
+        if last_refresh.elapsed() >= Duration::from_secs(5)
+            && !overlay.is_typing()
+            && !refresh_inflight
+        {
+            spawn_refresh(&args, &refresh_tx);
+            refresh_inflight = true;
             last_refresh = Instant::now();
         }
 
@@ -68,15 +96,25 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    run_voice_handoff(&mut terminal, &mut state, &args, &mut overlay)?;
+                    if !refresh_inflight {
+                        spawn_refresh(&args, &refresh_tx);
+                        refresh_inflight = true;
+                        last_refresh = Instant::now();
+                    }
+                }
                 KeyCode::Char(':') => {
                     overlay.input_mode = Some(InputMode::Picker);
                     overlay.input.clear();
                     overlay.message =
                         "choose input: [c] CMD shell · [t] Chat · [/] slash".to_string();
                 }
-                KeyCode::Char('s') => {
-                    state = state_for_args(&args)?;
-                    overlay.message = "status refreshed from backend".to_string();
+                KeyCode::Char('s') if !refresh_inflight => {
+                    spawn_refresh(&args, &refresh_tx);
+                    refresh_inflight = true;
+                    last_refresh = Instant::now();
+                    overlay.message = "refreshing backend status...".to_string();
                 }
                 KeyCode::Char('i') => push_operator_event(
                     &mut state,
@@ -94,6 +132,14 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn initial_state_for_args(args: &TuiArgs) -> Result<CockpitState> {
+    if let Some(fixture) = args.fixture.as_ref() {
+        backend::load_fixture(fixture)
+    } else {
+        Ok(backend::quick_cockpit_state(args.backend))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -169,7 +215,7 @@ fn handle_picker_key(
             overlay.message = "Chat slash mode: send a backend slash command".to_string();
         }
         KeyCode::Char('s') => {
-            *state = state_for_args(args)?;
+            refresh_state(state, args)?;
             overlay.input_mode = None;
             overlay.message = "status refreshed from backend".to_string();
         }
@@ -253,6 +299,61 @@ fn route_backend_prompt(
     };
 }
 
+fn run_voice_handoff(
+    terminal: &mut TerminalSession,
+    state: &mut CockpitState,
+    args: &TuiArgs,
+    overlay: &mut UiOverlay,
+) -> Result<()> {
+    push_operator_event(
+        state,
+        EventKind::Listening,
+        "voice: handing terminal to Hermes; enable /voice on then press Ctrl+B there",
+    );
+    terminal.suspend_for(|| backend::run_voice_session(args.backend));
+    refresh_state(state, args)?;
+    overlay.message = "voice session returned to Avu".to_string();
+    Ok(())
+}
+
+fn refresh_state(state: &mut CockpitState, args: &TuiArgs) -> Result<()> {
+    let refreshed = state_for_args(args)?;
+    apply_refreshed_state(state, refreshed);
+    Ok(())
+}
+
+fn apply_refreshed_state(state: &mut CockpitState, mut refreshed: CockpitState) {
+    let local_events: Vec<CockpitEvent> = state
+        .events
+        .iter()
+        .filter(|event| is_operator_event(&event.label))
+        .cloned()
+        .collect();
+    refreshed.events.extend(local_events);
+    keep_recent_state_events(&mut refreshed, 12);
+    *state = refreshed;
+}
+
+fn spawn_refresh(args: &TuiArgs, refresh_tx: &RefreshSender) {
+    let args = args.clone();
+    let refresh_tx = refresh_tx.clone();
+    thread::spawn(move || {
+        let result = state_for_args(&args).map_err(|error| error.to_string());
+        let _ = refresh_tx.send(result);
+    });
+}
+
+fn is_operator_event(label: &str) -> bool {
+    label.starts_with("cmd: ") || label.starts_with("backend: ") || label.starts_with("voice: ")
+}
+
+fn keep_recent_state_events(state: &mut CockpitState, limit: usize) {
+    if state.events.len() > limit {
+        let drop_count = state.events.len() - limit;
+        state.events.drain(0..drop_count);
+    }
+}
+
 fn push_operator_event(state: &mut CockpitState, kind: EventKind, label: &str) {
     state.events.push(CockpitEvent {
         at: chrono::Utc::now(),
@@ -281,6 +382,23 @@ impl TerminalSession {
         F: FnOnce(&mut ratatui::Frame<'_>),
     {
         self.terminal.draw(f).map(|_| ())
+    }
+
+    fn suspend_for<F>(&mut self, action: F)
+    where
+        F: FnOnce() -> backend::BackendCommandResult,
+    {
+        let _ = disable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let result = action();
+        eprintln!("Avu voice handoff: {}", result.summary);
+        let _ = enable_raw_mode();
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            EnterAlternateScreen,
+            Clear(ClearType::All)
+        );
+        let _ = self.terminal.clear();
     }
 }
 
@@ -413,7 +531,7 @@ fn render_control_sheet(frame: &mut ratatui::Frame<'_>, area: Rect, state: &Cock
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("[s]status [:]CMD/Chat [m]voice help [q]quit"),
+        Span::raw("[s]status [:]CMD/Chat [Ctrl+B]Hermes voice [m]help [q]quit"),
     ])];
 
     if let Some(approval) = state.pending_approval.as_ref() {
@@ -654,5 +772,25 @@ mod tests {
         assert_eq!(overlay.input, "hell");
         handle_input_key(&mut state, &args, &mut overlay, KeyCode::Delete).expect("delete works");
         assert_eq!(overlay.input, "hel");
+    }
+
+    #[test]
+    fn refresh_preserves_operator_events() {
+        let args = TuiArgs {
+            backend: crate::cli::BackendChoice::Fake,
+            ..TuiArgs::default()
+        };
+        let mut state = CockpitState::fake_listening();
+        state.events.clear();
+        push_operator_event(&mut state, EventKind::ResponseStream, "cmd: printf avu");
+
+        refresh_state(&mut state, &args).expect("refresh keeps local activity");
+
+        assert!(
+            state
+                .events
+                .iter()
+                .any(|event| event.label == "cmd: printf avu")
+        );
     }
 }
