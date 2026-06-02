@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
-    time::{Duration, SystemTime},
+    time::SystemTime,
 };
 
 pub trait BackendAdapter {
@@ -291,40 +291,19 @@ fn run_command_prompt(
         return BackendCommandResult::failed(format!("{command} command was not found on PATH"));
     }
 
-    let mut child = match Command::new(command)
+    let output = match Command::new(command)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .output()
     {
-        Ok(child) => child,
+        Ok(output) => output,
         Err(error) => {
-            return BackendCommandResult::failed(format!("failed to start {command}: {error}"));
+            return BackendCommandResult::failed(format!("failed to run {command}: {error}"));
         }
     };
 
-    for _ in 0..90 {
-        match child.try_wait() {
-            Ok(Some(_)) => match child.wait_with_output() {
-                Ok(output) => return summarize_output(output),
-                Err(error) => {
-                    return BackendCommandResult::failed(format!(
-                        "failed to read {command} output: {error}"
-                    ));
-                }
-            },
-            Ok(None) => thread::sleep(Duration::from_millis(500)),
-            Err(error) => {
-                return BackendCommandResult::failed(format!(
-                    "failed while waiting for {command}: {error}"
-                ));
-            }
-        }
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
-    BackendCommandResult::failed(format!("{command} prompt timed out after 45s"))
+    summarize_output(output)
 }
 
 #[derive(Debug, Clone)]

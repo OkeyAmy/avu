@@ -17,7 +17,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
 use std::{
-    io,
+    fs,
+    io::{self, Write},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -26,6 +27,10 @@ use std::{
 type RefreshResult = std::result::Result<CockpitState, String>;
 type RefreshSender = mpsc::Sender<RefreshResult>;
 type RefreshReceiver = mpsc::Receiver<RefreshResult>;
+
+type PromptResult = std::result::Result<backend::BackendCommandResult, String>;
+type PromptSender = mpsc::Sender<PromptResult>;
+type PromptReceiver = mpsc::Receiver<PromptResult>;
 
 pub fn run(args: TuiArgs) -> Result<()> {
     if args.once {
@@ -51,8 +56,18 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
     let mut state = initial_state_for_args(&args)?;
     let mut overlay = UiOverlay::default();
     let mut last_refresh = Instant::now();
+    let mut session_log = create_session_log();
     let (refresh_tx, refresh_rx): (RefreshSender, RefreshReceiver) = mpsc::channel();
     let mut refresh_inflight = false;
+    let (prompt_tx, prompt_rx): (PromptSender, PromptReceiver) = mpsc::channel();
+    let mut prompt_inflight = false;
+
+    push_operator_event(
+        &mut state,
+        EventKind::Idle,
+        &format!("Avu session started — {:?} backend", args.backend),
+        &mut session_log,
+    );
 
     loop {
         while let Ok(result) = refresh_rx.try_recv() {
@@ -68,12 +83,53 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
             }
         }
 
+        while let Ok(result) = prompt_rx.try_recv() {
+            prompt_inflight = false;
+            match result {
+                Ok(cmd_result) => {
+                    let kind = if cmd_result.ok {
+                        EventKind::ResponseStream
+                    } else {
+                        EventKind::Warning
+                    };
+                    let label = format!("backend: {}", compact(&cmd_result.summary, 120));
+                    push_operator_event(&mut state, kind, &label, &mut session_log);
+                    overlay.message = if cmd_result.ok {
+                        format!(
+                            "backend replied: {}",
+                            compact(&cmd_result.summary, 48)
+                        )
+                    } else {
+                        format!(
+                            "backend failed: {}",
+                            compact(&cmd_result.summary, 48)
+                        )
+                    };
+                    if !refresh_inflight {
+                        spawn_refresh(&args, &refresh_tx);
+                        refresh_inflight = true;
+                        last_refresh = Instant::now();
+                    }
+                }
+                Err(error) => {
+                    push_operator_event(
+                        &mut state,
+                        EventKind::Warning,
+                        &error,
+                        &mut session_log,
+                    );
+                    overlay.message = format!("backend error: {}", compact(&error, 48));
+                }
+            }
+        }
+
         engine::apply_projection(&mut state);
         terminal.draw(|frame| render_with_overlay(frame, &state, Some(&overlay)))?;
 
         if last_refresh.elapsed() >= Duration::from_secs(5)
             && !overlay.is_typing()
             && !refresh_inflight
+            && !prompt_inflight
         {
             spawn_refresh(&args, &refresh_tx);
             refresh_inflight = true;
@@ -87,7 +143,15 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
                 continue;
             }
             if overlay.input_mode.is_some() {
-                match handle_input_key(&mut state, &args, &mut overlay, key.code)? {
+                match handle_input_key(
+                    &mut state,
+                    &args,
+                    &mut overlay,
+                    key.code,
+                    &prompt_tx,
+                    &mut prompt_inflight,
+                    &mut session_log,
+                )? {
                     CommandAction::Continue => {}
                     CommandAction::Quit => break,
                 }
@@ -97,7 +161,13 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                 KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    run_voice_handoff(&mut terminal, &mut state, &args, &mut overlay)?;
+                    run_voice_handoff(
+                        &mut terminal,
+                        &mut state,
+                        &args,
+                        &mut overlay,
+                        &mut session_log,
+                    )?;
                     if !refresh_inflight {
                         spawn_refresh(&args, &refresh_tx);
                         refresh_inflight = true;
@@ -110,7 +180,7 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
                     overlay.message =
                         "choose input: [c] CMD shell · [t] Chat · [/] slash".to_string();
                 }
-                KeyCode::Char('s') if !refresh_inflight => {
+                KeyCode::Char('s') if !refresh_inflight && !prompt_inflight => {
                     spawn_refresh(&args, &refresh_tx);
                     refresh_inflight = true;
                     last_refresh = Instant::now();
@@ -120,15 +190,22 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
                     &mut state,
                     EventKind::Warning,
                     "interrupt requested; backend control routing not enabled yet",
+                    &mut session_log,
                 ),
                 KeyCode::Char('m') => push_operator_event(
                     &mut state,
                     EventKind::Listening,
                     "voice status requested; use :/voice, :/tts, or :/stt to route through backend",
+                    &mut session_log,
                 ),
                 _ => {}
             }
         }
+    }
+
+    if let Some(ref mut file) = session_log {
+        let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S");
+        let _ = writeln!(file, "[{ts}] [session] Avu session ended");
     }
 
     Ok(())
@@ -179,11 +256,14 @@ fn handle_input_key(
     args: &TuiArgs,
     overlay: &mut UiOverlay,
     key_code: KeyCode,
+    prompt_tx: &PromptSender,
+    prompt_inflight: &mut bool,
+    session_log: &mut Option<fs::File>,
 ) -> Result<CommandAction> {
     match overlay.input_mode {
         Some(InputMode::Picker) => handle_picker_key(state, args, overlay, key_code),
         Some(InputMode::Command) | Some(InputMode::Chat) => {
-            handle_text_input_key(state, args, overlay, key_code)
+            handle_text_input_key(state, args, overlay, key_code, prompt_tx, prompt_inflight, session_log)
         }
         None => Ok(CommandAction::Continue),
     }
@@ -230,6 +310,9 @@ fn handle_text_input_key(
     args: &TuiArgs,
     overlay: &mut UiOverlay,
     key_code: KeyCode,
+    prompt_tx: &PromptSender,
+    prompt_inflight: &mut bool,
+    session_log: &mut Option<fs::File>,
 ) -> Result<CommandAction> {
     match key_code {
         KeyCode::Esc => {
@@ -238,8 +321,10 @@ fn handle_text_input_key(
             overlay.message = "input cancelled".to_string();
         }
         KeyCode::Enter => match overlay.input_mode {
-            Some(InputMode::Command) => run_shell_input(state, overlay),
-            Some(InputMode::Chat) => route_chat_input(state, args, overlay),
+            Some(InputMode::Command) => run_shell_input(state, overlay, session_log),
+            Some(InputMode::Chat) => {
+                route_chat_input(state, args, overlay, prompt_tx, prompt_inflight, session_log)
+            }
             _ => {}
         },
         KeyCode::Backspace | KeyCode::Delete => {
@@ -251,7 +336,11 @@ fn handle_text_input_key(
     Ok(CommandAction::Continue)
 }
 
-fn run_shell_input(state: &mut CockpitState, overlay: &mut UiOverlay) {
+fn run_shell_input(
+    state: &mut CockpitState,
+    overlay: &mut UiOverlay,
+    session_log: &mut Option<fs::File>,
+) {
     let command = overlay.input.trim().to_string();
     overlay.input_mode = None;
     overlay.input.clear();
@@ -262,7 +351,7 @@ fn run_shell_input(state: &mut CockpitState, overlay: &mut UiOverlay) {
         EventKind::Warning
     };
     let label = format!("cmd: {}", compact(&result.summary, 120));
-    push_operator_event(state, kind, &label);
+    push_operator_event(state, kind, &label, session_log);
     overlay.message = if result.ok {
         format!("cmd ok: {}", compact(&result.summary, 48))
     } else {
@@ -270,33 +359,42 @@ fn run_shell_input(state: &mut CockpitState, overlay: &mut UiOverlay) {
     };
 }
 
-fn route_chat_input(state: &mut CockpitState, args: &TuiArgs, overlay: &mut UiOverlay) {
-    let prompt = overlay.input.trim().to_string();
-    overlay.input_mode = None;
-    overlay.input.clear();
-    route_backend_prompt(state, args, overlay, &prompt);
-}
-
-fn route_backend_prompt(
+fn route_chat_input(
     state: &mut CockpitState,
     args: &TuiArgs,
     overlay: &mut UiOverlay,
-    prompt: &str,
+    prompt_tx: &PromptSender,
+    prompt_inflight: &mut bool,
+    session_log: &mut Option<fs::File>,
 ) {
-    overlay.message = format!("routing to backend: {}", compact(prompt, 32));
-    let result = backend::adapter_for(args.backend).route_prompt(prompt);
-    let kind = if result.ok {
-        EventKind::ResponseStream
-    } else {
-        EventKind::Warning
-    };
-    let label = format!("backend: {}", compact(&result.summary, 120));
-    push_operator_event(state, kind, &label);
-    overlay.message = if result.ok {
-        format!("backend replied: {}", compact(&result.summary, 48))
-    } else {
-        format!("backend failed: {}", compact(&result.summary, 48))
-    };
+    let prompt = overlay.input.trim().to_string();
+    overlay.input_mode = None;
+    overlay.input.clear();
+    if prompt.is_empty() {
+        overlay.message = "empty prompt, cancelled".to_string();
+        return;
+    }
+    if *prompt_inflight {
+        overlay.message =
+            "already waiting for backend; wait for response or restart Avu".to_string();
+        return;
+    }
+    push_operator_event(
+        state,
+        EventKind::Processing,
+        &format!("sending: {}", compact(&prompt, 60)),
+        session_log,
+    );
+    overlay.message = "sending to backend...".to_string();
+    *prompt_inflight = true;
+    spawn_prompt(args.clone(), prompt_tx.clone(), prompt);
+}
+
+fn spawn_prompt(args: TuiArgs, tx: PromptSender, prompt: String) {
+    thread::spawn(move || {
+        let result = backend::adapter_for(args.backend).route_prompt(&prompt);
+        let _ = tx.send(Ok(result));
+    });
 }
 
 fn run_voice_handoff(
@@ -304,11 +402,13 @@ fn run_voice_handoff(
     state: &mut CockpitState,
     args: &TuiArgs,
     overlay: &mut UiOverlay,
+    session_log: &mut Option<fs::File>,
 ) -> Result<()> {
     push_operator_event(
         state,
         EventKind::Listening,
         "voice: handing terminal to Hermes; enable /voice on then press Ctrl+B there",
+        session_log,
     );
     terminal.suspend_for(|| backend::run_voice_session(args.backend));
     refresh_state(state, args)?;
@@ -344,7 +444,11 @@ fn spawn_refresh(args: &TuiArgs, refresh_tx: &RefreshSender) {
 }
 
 fn is_operator_event(label: &str) -> bool {
-    label.starts_with("cmd: ") || label.starts_with("backend: ") || label.starts_with("voice: ")
+    label.starts_with("cmd: ")
+        || label.starts_with("backend: ")
+        || label.starts_with("voice: ")
+        || label.starts_with("sending: ")
+        || label.starts_with("Avu session ")
 }
 
 fn keep_recent_state_events(state: &mut CockpitState, limit: usize) {
@@ -354,12 +458,39 @@ fn keep_recent_state_events(state: &mut CockpitState, limit: usize) {
     }
 }
 
-fn push_operator_event(state: &mut CockpitState, kind: EventKind, label: &str) {
+fn push_operator_event(
+    state: &mut CockpitState,
+    kind: EventKind,
+    label: &str,
+    log: &mut Option<fs::File>,
+) {
+    let ts = chrono::Utc::now();
     state.events.push(CockpitEvent {
-        at: chrono::Utc::now(),
-        kind,
+        at: ts,
+        kind: kind.clone(),
         label: label.to_string(),
     });
+    if let Some(file) = log.as_mut() {
+        let label_ts = ts.format("%Y-%m-%d %H:%M:%S");
+        let _ = writeln!(file, "[{label_ts}] [{kind:?}] {label}");
+    }
+}
+
+fn create_session_log() -> Option<fs::File> {
+    let paths = crate::config::AvuPaths::discover();
+    fs::create_dir_all(&paths.logs).ok()?;
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    let path = paths.logs.join(format!("avu-session-{timestamp}.log"));
+    match fs::File::create(&path) {
+        Ok(file) => {
+            eprintln!("Avu session log: {}", path.display());
+            Some(file)
+        }
+        Err(error) => {
+            eprintln!("Avu session log disabled: {error}");
+            None
+        }
+    }
 }
 
 struct TerminalSession {
@@ -725,15 +856,27 @@ mod tests {
             input: "/voice".to_string(),
             message: String::new(),
         };
+        let (prompt_tx, _prompt_rx) = mpsc::channel();
+        let mut prompt_inflight = false;
+        let mut session_log = None;
 
-        let action = handle_text_input_key(&mut state, &args, &mut overlay, KeyCode::Enter)
-            .expect("command routes");
+        let action = handle_text_input_key(
+            &mut state,
+            &args,
+            &mut overlay,
+            KeyCode::Enter,
+            &prompt_tx,
+            &mut prompt_inflight,
+            &mut session_log,
+        )
+        .expect("command routes");
 
         assert!(action.is_continue());
-        assert!(overlay.message.contains("backend replied"));
+        assert!(overlay.message.contains("sending to backend"));
+        assert!(prompt_inflight);
         assert!(state.events.iter().any(|event| {
-            event.kind == EventKind::ResponseStream
-                && event.label.contains("fixture backend received: /voice")
+            event.kind == EventKind::Processing
+                && event.label.contains("sending: /voice")
         }));
     }
 
@@ -746,14 +889,33 @@ mod tests {
             input: String::new(),
             message: String::new(),
         };
+        let (prompt_tx, _prompt_rx) = mpsc::channel();
+        let mut prompt_inflight = false;
+        let mut session_log = None;
 
-        handle_input_key(&mut state, &args, &mut overlay, KeyCode::Char('c'))
-            .expect("cmd mode selected");
+        handle_input_key(
+            &mut state,
+            &args,
+            &mut overlay,
+            KeyCode::Char('c'),
+            &prompt_tx,
+            &mut prompt_inflight,
+            &mut session_log,
+        )
+        .expect("cmd mode selected");
         assert_eq!(overlay.input_mode, Some(InputMode::Command));
 
         overlay.input_mode = Some(InputMode::Picker);
-        handle_input_key(&mut state, &args, &mut overlay, KeyCode::Char('t'))
-            .expect("chat mode selected");
+        handle_input_key(
+            &mut state,
+            &args,
+            &mut overlay,
+            KeyCode::Char('t'),
+            &prompt_tx,
+            &mut prompt_inflight,
+            &mut session_log,
+        )
+        .expect("chat mode selected");
         assert_eq!(overlay.input_mode, Some(InputMode::Chat));
     }
 
@@ -766,11 +928,31 @@ mod tests {
             input: "hello".to_string(),
             message: String::new(),
         };
+        let (prompt_tx, _prompt_rx) = mpsc::channel();
+        let mut prompt_inflight = false;
+        let mut session_log = None;
 
-        handle_input_key(&mut state, &args, &mut overlay, KeyCode::Backspace)
-            .expect("backspace works");
+        handle_input_key(
+            &mut state,
+            &args,
+            &mut overlay,
+            KeyCode::Backspace,
+            &prompt_tx,
+            &mut prompt_inflight,
+            &mut session_log,
+        )
+        .expect("backspace works");
         assert_eq!(overlay.input, "hell");
-        handle_input_key(&mut state, &args, &mut overlay, KeyCode::Delete).expect("delete works");
+        handle_input_key(
+            &mut state,
+            &args,
+            &mut overlay,
+            KeyCode::Delete,
+            &prompt_tx,
+            &mut prompt_inflight,
+            &mut session_log,
+        )
+        .expect("delete works");
         assert_eq!(overlay.input, "hel");
     }
 
@@ -782,7 +964,8 @@ mod tests {
         };
         let mut state = CockpitState::fake_listening();
         state.events.clear();
-        push_operator_event(&mut state, EventKind::ResponseStream, "cmd: printf avu");
+        let mut session_log = None;
+        push_operator_event(&mut state, EventKind::ResponseStream, "cmd: printf avu", &mut session_log);
 
         refresh_state(&mut state, &args).expect("refresh keeps local activity");
 
