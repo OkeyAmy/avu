@@ -133,11 +133,11 @@ pub fn openclaw_snapshot(command_exists: bool) -> RuntimeSnapshot {
     }
 }
 
-/// Read recent Hermes agent log output via `hermes logs agent --lines 30`.
+/// Read recent Hermes agent log output via `hermes logs agent --since 15m --lines 30`.
 /// Hermes agent.log captures all agent activity: API calls, tool dispatch, session lifecycle.
 pub fn read_hermes_log_events() -> Vec<CockpitEvent> {
     let output = match Command::new("hermes")
-        .args(["logs", "agent", "--lines", "30"])
+        .args(["logs", "agent", "--since", "15m", "--lines", "30"])
         .output()
     {
         Ok(output) if output.status.success() => output,
@@ -153,8 +153,7 @@ pub fn read_hermes_log_events() -> Vec<CockpitEvent> {
             events.push(event);
         }
     }
-    events.reverse();
-    events.truncate(12);
+    keep_recent_events(&mut events, 12);
     events
 }
 
@@ -173,7 +172,7 @@ fn parse_hermes_log_line(line: &str) -> Option<CockpitEvent> {
         let rest = &line[line.find(']').map(|i| i + 1).unwrap_or(20)..];
         (ts, rest.trim())
     } else {
-        ("", line)
+        return None;
     };
 
     let at = if !timestamp_str.is_empty() {
@@ -236,6 +235,14 @@ fn parse_hermes_log_line(line: &str) -> Option<CockpitEvent> {
         Some(CockpitEvent {
             at,
             kind: EventKind::ApprovalRequested,
+            label: rest.to_string(),
+        })
+    } else if lower.contains("tool loop warning")
+        || lower.contains("repeated_exact_failure_warning")
+    {
+        Some(CockpitEvent {
+            at,
+            kind: EventKind::Warning,
             label: rest.to_string(),
         })
     } else if lower.contains("error") || lower.contains("failed") || lower.contains("exception") {
@@ -302,9 +309,15 @@ pub fn read_openclaw_log_events() -> Vec<CockpitEvent> {
             events.push(event);
         }
     }
-    events.reverse();
-    events.truncate(12);
+    keep_recent_events(&mut events, 12);
     events
+}
+
+fn keep_recent_events(events: &mut Vec<CockpitEvent>, limit: usize) {
+    if events.len() > limit {
+        let drop_count = events.len() - limit;
+        events.drain(0..drop_count);
+    }
 }
 
 /// Parse an OpenClaw JSONL log entry into a CockpitEvent.
@@ -778,6 +791,18 @@ Other profiles:
     }
 
     #[test]
+    fn keeps_recent_events_in_chronological_order() {
+        let mut events = vec![
+            CockpitEvent::now(EventKind::Idle, "old idle"),
+            CockpitEvent::now(EventKind::Processing, "middle processing"),
+            CockpitEvent::now(EventKind::Speaking, "new speaking"),
+        ];
+        keep_recent_events(&mut events, 2);
+        assert_eq!(events[0].label, "middle processing");
+        assert_eq!(events[1].label, "new speaking");
+    }
+
+    #[test]
     fn parses_hermes_log_line_tool_start() {
         let line = "2026-06-01 12:00:03,456 [INFO] tools: tool dispatch start: web.search";
         let event = parse_hermes_log_line(line);
@@ -831,6 +856,14 @@ Other profiles:
         let event = parse_hermes_log_line(line);
         assert!(event.is_some());
         assert_eq!(event.unwrap().kind, EventKind::Error);
+    }
+
+    #[test]
+    fn parses_hermes_loop_failure_warning_without_error_mode() {
+        let line = "2026-06-02 08:01:07,185 [WARNING] repeated_exact_failure_warning; count=2; skill_manage has failed 2 times with identical arguments";
+        let event = parse_hermes_log_line(line);
+        assert!(event.is_some());
+        assert_eq!(event.unwrap().kind, EventKind::Warning);
     }
 
     #[test]

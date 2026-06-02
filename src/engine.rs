@@ -105,12 +105,15 @@ pub fn project_events(state: &CockpitState) -> CockpitProjection {
 }
 
 pub fn apply_projection(state: &mut CockpitState) {
-    if is_runtime_snapshot_state(state) {
-        return;
-    }
+    let preserve_reported_voice = is_runtime_snapshot_state(state);
+    let reported_voice = state.voice_label.clone();
     let projection = project_events(state);
     state.mode = projection.mode;
-    state.voice_label = projection.voice_label;
+    state.voice_label = if preserve_reported_voice {
+        reported_voice
+    } else {
+        projection.voice_label
+    };
     state.tools_active = projection.tools_active;
 }
 
@@ -168,5 +171,34 @@ mod tests {
             CockpitEvent::now(EventKind::ApprovalRequested, "approval:terminal"),
         );
         assert_eq!(state.mode, CockpitMode::ApprovalNeeded);
+    }
+
+    #[test]
+    fn live_runtime_events_drive_mode_without_overwriting_voice_config() {
+        let mut state = CockpitState::from_runtime(crate::runtime::RuntimeSnapshot {
+            backend: crate::domain::BackendKind::Hermes,
+            backend_label: "HERMES".to_string(),
+            reachable: true,
+            model_label: crate::runtime::Reported::Value("model".to_string()),
+            voice_label: crate::runtime::Reported::Value("STT groq · TTS gemini/Kore".to_string()),
+            events: crate::runtime::Reported::Unreported,
+            approvals: crate::runtime::Reported::Unreported,
+            interrupt: crate::runtime::Reported::Unreported,
+            pause_resume: crate::runtime::Reported::Unreported,
+            sessions_list: crate::runtime::Reported::Unreported,
+            transcript: crate::runtime::Reported::Unreported,
+            wake_available: crate::runtime::Reported::Unreported,
+            permission_posture: crate::domain::PermissionPosture::ObserveNotify,
+            log_events: vec![CockpitEvent::now(
+                EventKind::Speaking,
+                "TTS audio playback started",
+            )],
+            notes: vec![],
+        });
+
+        apply_projection(&mut state);
+
+        assert_eq!(state.mode, CockpitMode::Speaking);
+        assert_eq!(state.voice_label, "STT groq · TTS gemini/Kore");
     }
 }
