@@ -52,11 +52,11 @@ fn state_for_args(args: &TuiArgs) -> Result<CockpitState> {
 }
 
 fn run_interactive(args: TuiArgs) -> Result<()> {
+    let mut session_log = create_session_log();
     let mut terminal = TerminalSession::start()?;
     let mut state = initial_state_for_args(&args)?;
     let mut overlay = UiOverlay::default();
     let mut last_refresh = Instant::now();
-    let mut session_log = create_session_log();
     let (refresh_tx, refresh_rx): (RefreshSender, RefreshReceiver) = mpsc::channel();
     let mut refresh_inflight = false;
     let (prompt_tx, prompt_rx): (PromptSender, PromptReceiver) = mpsc::channel();
@@ -169,7 +169,7 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
                     overlay.input_mode = Some(InputMode::Picker);
                     overlay.clear_input();
                     overlay.message =
-                        "choose input: [c] CMD shell · [t] Chat · [/] slash".to_string();
+                        "choose input: [c] CMD shell · [t] Chat · [/] backend CLI".to_string();
                 }
                 KeyCode::Char('s') if !refresh_inflight && !prompt_inflight => {
                     spawn_refresh(&args, &refresh_tx);
@@ -207,6 +207,7 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
     if let Some(ref mut file) = session_log {
         let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S");
         let _ = writeln!(file, "[{ts}] [session] Avu session ended");
+        let _ = file.flush();
     }
 
     Ok(())
@@ -310,6 +311,40 @@ impl UiOverlay {
         let suffix = if start + max_chars < total { "…" } else { "" };
         format!("{prefix}{body}{suffix}")
     }
+
+    fn visible_input_with_cursor(&self, max_chars: usize) -> String {
+        let total = self.input_len();
+        if total == 0 {
+            return "▌".to_string();
+        }
+        let max_chars = max_chars.max(1);
+        let half = max_chars / 2;
+        let start = if total <= max_chars {
+            0
+        } else {
+            self.input_cursor
+                .saturating_sub(half)
+                .min(total.saturating_sub(max_chars))
+        };
+        let end = (start + max_chars).min(total);
+        let mut output = String::new();
+        if start > 0 {
+            output.push('…');
+        }
+        for (index, ch) in self.input.chars().enumerate().skip(start).take(end - start) {
+            if index == self.input_cursor {
+                output.push('▌');
+            }
+            output.push(ch);
+        }
+        if self.input_cursor >= end {
+            output.push('▌');
+        }
+        if end < total {
+            output.push('…');
+        }
+        output
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -317,6 +352,7 @@ enum InputMode {
     Picker,
     Command,
     Chat,
+    Slash,
 }
 
 enum CommandAction {
@@ -342,7 +378,7 @@ fn handle_input_key(
 ) -> Result<CommandAction> {
     match overlay.input_mode {
         Some(InputMode::Picker) => handle_picker_key(state, args, overlay, key_code),
-        Some(InputMode::Command) | Some(InputMode::Chat) => handle_text_input_key(
+        Some(InputMode::Command) | Some(InputMode::Chat) | Some(InputMode::Slash) => handle_text_input_key(
             state,
             args,
             overlay,
@@ -376,10 +412,9 @@ fn handle_picker_key(
             overlay.message = "Chat mode: type a message for Hermes/OpenClaw".to_string();
         }
         KeyCode::Char('/') => {
-            overlay.input_mode = Some(InputMode::Chat);
+            overlay.input_mode = Some(InputMode::Slash);
             overlay.clear_input();
-            overlay.insert_char('/');
-            overlay.message = "Chat slash mode: send a backend slash command".to_string();
+            overlay.message = "Backend CLI mode: type e.g. status --all".to_string();
         }
         KeyCode::Char('s') => {
             refresh_state(state, args)?;
@@ -417,6 +452,7 @@ fn handle_text_input_key(
                 prompt_inflight,
                 session_log,
             ),
+            Some(InputMode::Slash) => run_backend_cli_input(state, args, overlay, session_log),
             _ => {}
         },
         KeyCode::PageUp => {
@@ -464,6 +500,29 @@ fn run_shell_input(
     };
 }
 
+fn run_backend_cli_input(
+    state: &mut CockpitState,
+    args: &TuiArgs,
+    overlay: &mut UiOverlay,
+    session_log: &mut Option<fs::File>,
+) {
+    let command = overlay.input.trim().to_string();
+    overlay.clear_input();
+    let result = backend::run_backend_cli_command(args.backend, &command);
+    let kind = if result.ok {
+        EventKind::ResponseStream
+    } else {
+        EventKind::Warning
+    };
+    let label = format!("backend-cli: /{} => {}", command, result.summary);
+    push_operator_event(state, kind, &label, session_log);
+    overlay.message = if result.ok {
+        format!("backend cli ok: {}", compact(&result.summary, 48))
+    } else {
+        format!("backend cli failed: {}", compact(&result.summary, 48))
+    };
+}
+
 fn route_chat_input(
     state: &mut CockpitState,
     args: &TuiArgs,
@@ -480,7 +539,7 @@ fn route_chat_input(
     }
     if *prompt_inflight {
         overlay.message =
-            "already waiting for backend; wait for response or restart Avu".to_string();
+            "backend still running; wait for response (draft preserved)".to_string();
         return;
     }
     overlay.clear_input();
@@ -551,6 +610,7 @@ fn spawn_refresh(args: &TuiArgs, refresh_tx: &RefreshSender) {
 fn is_operator_event(label: &str) -> bool {
     label.starts_with("cmd: ")
         || label.starts_with("backend: ")
+        || label.starts_with("backend-cli: ")
         || label.starts_with("voice: ")
         || label.starts_with("sending: ")
         || label.starts_with("Avu session ")
@@ -578,6 +638,7 @@ fn push_operator_event(
     if let Some(file) = log.as_mut() {
         let label_ts = ts.format("%Y-%m-%d %H:%M:%S");
         let _ = writeln!(file, "[{label_ts}] [{kind:?}] {label}");
+        let _ = file.flush();
     }
 }
 
@@ -604,6 +665,7 @@ fn write_state_snapshot(log: &mut Option<fs::File>, reason: &str, state: &Cockpi
             event.kind, event.label
         );
     }
+    let _ = file.flush();
 }
 
 fn create_session_log() -> Option<fs::File> {

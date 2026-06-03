@@ -260,6 +260,65 @@ pub fn run_shell_command(command: &str) -> BackendCommandResult {
     summarize_output(output)
 }
 
+pub fn run_backend_cli_command(choice: BackendChoice, command_text: &str) -> BackendCommandResult {
+    let command_text = command_text.trim().trim_start_matches('/').trim();
+    if command_text.is_empty() {
+        return BackendCommandResult::failed("empty backend command");
+    }
+    let backend = adapter_for(choice);
+    let label = backend.label();
+    if !matches!(label, "hermes" | "openclaw") {
+        return BackendCommandResult::failed("backend CLI command requires Hermes or OpenClaw");
+    }
+    if !command_exists(label) {
+        return BackendCommandResult::failed(format!("{label} command was not found on PATH"));
+    }
+    let args = match split_command_args(command_text) {
+        Ok(args) => args,
+        Err(error) => return BackendCommandResult::failed(error),
+    };
+    if args.is_empty() {
+        return BackendCommandResult::failed("empty backend command");
+    }
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    run_command_prompt(label, &arg_refs, None)
+}
+
+fn split_command_args(input: &str) -> std::result::Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escape = false;
+    for ch in input.chars() {
+        if escape {
+            current.push(ch);
+            escape = false;
+            continue;
+        }
+        match ch {
+            '\\' => escape = true,
+            '\'' | '"' if quote == Some(ch) => quote = None,
+            '\'' | '"' if quote.is_none() => quote = Some(ch),
+            ch if ch.is_whitespace() && quote.is_none() => {
+                if !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                }
+            }
+            ch => current.push(ch),
+        }
+    }
+    if escape {
+        current.push('\\');
+    }
+    if quote.is_some() {
+        return Err("unterminated quote in backend command".to_string());
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    Ok(args)
+}
+
 pub fn run_voice_session(choice: BackendChoice) -> BackendCommandResult {
     match adapter_for(choice).label() {
         "hermes" => run_interactive_backend("hermes", &["--continue", "avu-tui", "--tui"]),
