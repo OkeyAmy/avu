@@ -5,11 +5,13 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use std::{
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 pub trait BackendAdapter {
@@ -389,6 +391,13 @@ fn newer_audio<'a>(
 }
 
 fn play_audio(path: &Path) -> Option<String> {
+    if cfg!(target_os = "linux")
+        && !linux_has_session_audio_sink()
+        && let Some(result) = play_audio_with_alsa_hardware(path)
+    {
+        return Some(result);
+    }
+
     let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
         &[("afplay", &[])]
     } else if cfg!(windows) {
@@ -405,7 +414,6 @@ fn play_audio(path: &Path) -> Option<String> {
             ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet"]),
             ("mpv", &["--really-quiet"]),
             ("paplay", &[]),
-            ("aplay", &[]),
             ("xdg-open", &[]),
         ]
     };
@@ -432,7 +440,143 @@ fn play_audio(path: &Path) -> Option<String> {
             Err(_) => continue,
         }
     }
+    if cfg!(target_os = "linux") {
+        play_audio_with_alsa_hardware(path)
+    } else {
+        None
+    }
+}
+
+fn linux_has_session_audio_sink() -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    command_stdout("pactl", &["list", "short", "sinks"])
+        .map(|text| text.lines().any(|line| !line.trim().is_empty()))
+        .unwrap_or(false)
+        || command_stdout("wpctl", &["status"])
+            .map(|text| {
+                text.lines()
+                    .any(|line| line.trim_start().starts_with("Sinks:"))
+            })
+            .unwrap_or(false)
+}
+
+fn play_audio_with_alsa_hardware(path: &Path) -> Option<String> {
+    if !command_exists("aplay") {
+        return None;
+    }
+    let playable_path = alsa_playable_path(path)?;
+    for device in alsa_hardware_devices() {
+        if spawn_checked_audio_player(
+            "aplay",
+            &[
+                OsString::from("-D"),
+                OsString::from(device.clone()),
+                playable_path.clone().into(),
+            ],
+        ) {
+            return Some(format!("started with aplay {device}"));
+        }
+    }
     None
+}
+
+fn alsa_playable_path(path: &Path) -> Option<PathBuf> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if extension == "wav" {
+        return Some(path.to_path_buf());
+    }
+    if !command_exists("ffmpeg") {
+        return None;
+    }
+    let mut target = env::temp_dir();
+    target.push(format!(
+        "avu-audio-{}-{}.wav",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-i"])
+        .arg(path)
+        .args(["-ar", "48000", "-ac", "2"])
+        .arg(&target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    status.success().then_some(target)
+}
+
+fn alsa_hardware_devices() -> Vec<String> {
+    command_stdout("aplay", &["-l"])
+        .map(|text| parse_alsa_hardware_devices(&text))
+        .unwrap_or_default()
+}
+
+fn parse_alsa_hardware_devices(text: &str) -> Vec<String> {
+    let mut devices = Vec::new();
+    for line in text.lines() {
+        let Some(card_part) = line.trim_start().strip_prefix("card ") else {
+            continue;
+        };
+        let Some((card, rest)) = card_part.split_once(':') else {
+            continue;
+        };
+        let Some(device_part) = rest.split("device ").nth(1) else {
+            continue;
+        };
+        let Some((device, _)) = device_part.split_once(':') else {
+            continue;
+        };
+        devices.push(format!("hw:{},{}", card.trim(), device.trim()));
+    }
+    devices
+}
+
+fn spawn_checked_audio_player(program: &str, args: &[OsString]) -> bool {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    thread::sleep(Duration::from_millis(300));
+    match child.try_wait() {
+        Ok(Some(status)) => status.success(),
+        Ok(None) => {
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
+    if !command_exists(program) {
+        return None;
+    }
+    let output = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn summarize_output(output: std::process::Output) -> BackendCommandResult {
@@ -522,6 +666,15 @@ mod tests {
         assert!(result.ok);
         assert_eq!(result.summary, "backend generated audio");
         assert_eq!(result.audio_path, Some(PathBuf::from("/tmp/avu-voice.ogg")));
+    }
+
+    #[test]
+    fn parses_alsa_hardware_devices_from_aplay_output() {
+        let text = "**** List of PLAYBACK Hardware Devices ****\ncard 0: I82801AAICH [Intel 82801AA-ICH], device 0: Intel ICH [Intel ICH]\n  Subdevices: 1/1\ncard 2: USB [USB Audio], device 3: Speaker [USB Speaker]\n";
+
+        let devices = parse_alsa_hardware_devices(text);
+
+        assert_eq!(devices, vec!["hw:0,0", "hw:2,3"]);
     }
 
     #[cfg(unix)]
