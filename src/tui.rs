@@ -68,12 +68,14 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
         &format!("Avu session started — {:?} backend", args.backend),
         &mut session_log,
     );
+    write_state_snapshot(&mut session_log, "start", &state);
 
     loop {
         while let Ok(result) = refresh_rx.try_recv() {
             refresh_inflight = false;
             match result {
                 Ok(refreshed) => {
+                    write_state_snapshot(&mut session_log, "refresh", &refreshed);
                     apply_refreshed_state(&mut state, refreshed);
                     overlay.message = "backend status refreshed".to_string();
                 }
@@ -165,7 +167,7 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
                 }
                 KeyCode::Char(':') => {
                     overlay.input_mode = Some(InputMode::Picker);
-                    overlay.input.clear();
+                    overlay.clear_input();
                     overlay.message =
                         "choose input: [c] CMD shell · [t] Chat · [/] slash".to_string();
                 }
@@ -222,6 +224,7 @@ fn initial_state_for_args(args: &TuiArgs) -> Result<CockpitState> {
 struct UiOverlay {
     input_mode: Option<InputMode>,
     input: String,
+    input_cursor: usize,
     message: String,
     activity_scroll: usize,
 }
@@ -229,6 +232,83 @@ struct UiOverlay {
 impl UiOverlay {
     fn is_typing(&self) -> bool {
         self.input_mode.is_some()
+    }
+
+    fn clear_input(&mut self) {
+        self.input.clear();
+        self.input_cursor = 0;
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        let byte_index = self.cursor_byte_index();
+        self.input.insert(byte_index, ch);
+        self.input_cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        let remove_at = self.nth_char_byte_index(self.input_cursor - 1);
+        self.input.remove(remove_at);
+        self.input_cursor -= 1;
+    }
+
+    fn delete(&mut self) {
+        if self.input_cursor >= self.input_len() {
+            return;
+        }
+        let remove_at = self.cursor_byte_index();
+        self.input.remove(remove_at);
+    }
+
+    fn move_left(&mut self) {
+        self.input_cursor = self.input_cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        self.input_cursor = (self.input_cursor + 1).min(self.input_len());
+    }
+
+    fn move_home(&mut self) {
+        self.input_cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.input_cursor = self.input_len();
+    }
+
+    fn input_len(&self) -> usize {
+        self.input.chars().count()
+    }
+
+    fn cursor_byte_index(&self) -> usize {
+        self.nth_char_byte_index(self.input_cursor)
+    }
+
+    fn nth_char_byte_index(&self, char_index: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(char_index)
+            .map(|(index, _)| index)
+            .unwrap_or(self.input.len())
+    }
+
+    fn visible_input(&self, max_chars: usize) -> String {
+        if max_chars == 0 {
+            return String::new();
+        }
+        let total = self.input_len();
+        if total <= max_chars {
+            return self.input.clone();
+        }
+        let half = max_chars / 2;
+        let start = self.input_cursor.saturating_sub(half);
+        let start = start.min(total.saturating_sub(max_chars));
+        let body: String = self.input.chars().skip(start).take(max_chars).collect();
+        let prefix = if start > 0 { "…" } else { "" };
+        let suffix = if start + max_chars < total { "…" } else { "" };
+        format!("{prefix}{body}{suffix}")
     }
 }
 
@@ -284,7 +364,7 @@ fn handle_picker_key(
     match key_code {
         KeyCode::Esc => {
             overlay.input_mode = None;
-            overlay.input.clear();
+            overlay.clear_input();
             overlay.message = "input cancelled".to_string();
         }
         KeyCode::Char('c') => {
@@ -297,7 +377,8 @@ fn handle_picker_key(
         }
         KeyCode::Char('/') => {
             overlay.input_mode = Some(InputMode::Chat);
-            overlay.input.push('/');
+            overlay.clear_input();
+            overlay.insert_char('/');
             overlay.message = "Chat slash mode: send a backend slash command".to_string();
         }
         KeyCode::Char('s') => {
@@ -323,7 +404,7 @@ fn handle_text_input_key(
     match key_code {
         KeyCode::Esc => {
             overlay.input_mode = None;
-            overlay.input.clear();
+            overlay.clear_input();
             overlay.message = "input cancelled".to_string();
         }
         KeyCode::Enter => match overlay.input_mode {
@@ -345,9 +426,17 @@ fn handle_text_input_key(
             overlay.activity_scroll = overlay.activity_scroll.saturating_sub(1);
         }
         KeyCode::Backspace | KeyCode::Delete => {
-            overlay.input.pop();
+            if matches!(key_code, KeyCode::Backspace) {
+                overlay.backspace();
+            } else {
+                overlay.delete();
+            }
         }
-        KeyCode::Char(ch) => overlay.input.push(ch),
+        KeyCode::Left => overlay.move_left(),
+        KeyCode::Right => overlay.move_right(),
+        KeyCode::Home => overlay.move_home(),
+        KeyCode::End => overlay.move_end(),
+        KeyCode::Char(ch) => overlay.insert_char(ch),
         _ => {}
     }
     Ok(CommandAction::Continue)
@@ -359,7 +448,7 @@ fn run_shell_input(
     session_log: &mut Option<fs::File>,
 ) {
     let command = overlay.input.trim().to_string();
-    overlay.input.clear();
+    overlay.clear_input();
     let result = backend::run_shell_command(&command);
     let kind = if result.ok {
         EventKind::ResponseStream
@@ -385,7 +474,7 @@ fn route_chat_input(
 ) {
     let prompt = overlay.input.trim().to_string();
     if prompt.is_empty() {
-        overlay.input.clear();
+        overlay.clear_input();
         overlay.message = "empty prompt, cancelled".to_string();
         return;
     }
@@ -394,7 +483,7 @@ fn route_chat_input(
             "already waiting for backend; wait for response or restart Avu".to_string();
         return;
     }
-    overlay.input.clear();
+    overlay.clear_input();
     push_operator_event(
         state,
         EventKind::Processing,
@@ -489,6 +578,31 @@ fn push_operator_event(
     if let Some(file) = log.as_mut() {
         let label_ts = ts.format("%Y-%m-%d %H:%M:%S");
         let _ = writeln!(file, "[{label_ts}] [{kind:?}] {label}");
+    }
+}
+
+fn write_state_snapshot(log: &mut Option<fs::File>, reason: &str, state: &CockpitState) {
+    let Some(file) = log.as_mut() else {
+        return;
+    };
+    let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S");
+    let _ = writeln!(
+        file,
+        "[{ts}] [snapshot:{reason}] backend={} model={} voice={} mode={:?} tools={} events={}",
+        state.backend_label,
+        state.model_label,
+        state.voice_label,
+        state.mode,
+        state.tools_active,
+        state.events.len()
+    );
+    for event in state.events.iter().rev().take(12).rev() {
+        let event_ts = event.at.format("%Y-%m-%d %H:%M:%S");
+        let _ = writeln!(
+            file,
+            "[{event_ts}] [runtime:{:?}] {}",
+            event.kind, event.label
+        );
     }
 }
 
@@ -840,8 +954,18 @@ fn render_footer(
                     InputMode::Picker => {
                         "  │ INPUT: [c] CMD  [t] Chat  [/] Slash  [Esc] cancel".to_string()
                     }
-                    InputMode::Command => format!("  │ CMD: {}", overlay.input),
-                    InputMode::Chat => format!("  │ Chat: {}", overlay.input),
+                    InputMode::Command => format!(
+                        "  │ CMD[{}/{}]: {}",
+                        overlay.input_cursor,
+                        overlay.input_len(),
+                        overlay.visible_input(64)
+                    ),
+                    InputMode::Chat => format!(
+                        "  │ Chat[{}/{}]: {}",
+                        overlay.input_cursor,
+                        overlay.input_len(),
+                        overlay.visible_input(64)
+                    ),
                 }
             } else if overlay.message.is_empty() {
                 "  │ PRESS : for CMD/Chat".to_string()
@@ -936,6 +1060,7 @@ mod tests {
         let mut overlay = UiOverlay {
             input_mode: Some(InputMode::Chat),
             input: "/voice".to_string(),
+            input_cursor: 6,
             message: String::new(),
             activity_scroll: 0,
         };
@@ -971,6 +1096,7 @@ mod tests {
         let mut overlay = UiOverlay {
             input_mode: Some(InputMode::Picker),
             input: String::new(),
+            input_cursor: 0,
             message: String::new(),
             activity_scroll: 0,
         };
@@ -1011,6 +1137,7 @@ mod tests {
         let mut overlay = UiOverlay {
             input_mode: Some(InputMode::Chat),
             input: "hello".to_string(),
+            input_cursor: 5,
             message: String::new(),
             activity_scroll: 0,
         };
@@ -1033,6 +1160,16 @@ mod tests {
             &mut state,
             &args,
             &mut overlay,
+            KeyCode::Left,
+            &prompt_tx,
+            &mut prompt_inflight,
+            &mut session_log,
+        )
+        .expect("left works");
+        handle_input_key(
+            &mut state,
+            &args,
+            &mut overlay,
             KeyCode::Delete,
             &prompt_tx,
             &mut prompt_inflight,
@@ -1040,6 +1177,72 @@ mod tests {
         )
         .expect("delete works");
         assert_eq!(overlay.input, "hel");
+    }
+
+    #[test]
+    fn input_buffer_supports_left_right_home_end_midline_edit() {
+        let args = TuiArgs::default();
+        let mut state = CockpitState::fake_listening();
+        let mut overlay = UiOverlay {
+            input_mode: Some(InputMode::Chat),
+            input: "alpha gamma".to_string(),
+            input_cursor: 5,
+            message: String::new(),
+            activity_scroll: 0,
+        };
+        let (prompt_tx, _prompt_rx) = mpsc::channel();
+        let mut prompt_inflight = false;
+        let mut session_log = None;
+
+        for key in [
+            KeyCode::Char(' '),
+            KeyCode::Char('b'),
+            KeyCode::Char('e'),
+            KeyCode::Char('t'),
+            KeyCode::Char('a'),
+            KeyCode::End,
+            KeyCode::Left,
+            KeyCode::Backspace,
+            KeyCode::Right,
+            KeyCode::Char('!'),
+            KeyCode::Home,
+            KeyCode::Delete,
+        ] {
+            handle_input_key(
+                &mut state,
+                &args,
+                &mut overlay,
+                key,
+                &prompt_tx,
+                &mut prompt_inflight,
+                &mut session_log,
+            )
+            .expect("edit key works");
+        }
+
+        assert_eq!(overlay.input, "lpha beta gama!");
+        assert_eq!(overlay.input_cursor, 0);
+    }
+
+    #[test]
+    fn avu_session_log_is_created_and_grows_with_runtime_snapshot() {
+        let temp = tempfile::NamedTempFile::new().expect("temp log");
+        let mut log = Some(temp.reopen().expect("reopen log"));
+        let mut state = CockpitState::fake_listening();
+        state.events.clear();
+        state.events.push(CockpitEvent {
+            at: chrono::Utc::now(),
+            kind: EventKind::ToolStart,
+            label: "backend runtime tool event".to_string(),
+        });
+
+        write_state_snapshot(&mut log, "test", &state);
+        drop(log);
+        let text = std::fs::read_to_string(temp.path()).expect("read log");
+
+        assert!(text.contains("[snapshot:test]"));
+        assert!(text.contains("backend="));
+        assert!(text.contains("backend runtime tool event"));
     }
 
     #[test]
@@ -1052,6 +1255,7 @@ mod tests {
         let mut overlay = UiOverlay {
             input_mode: Some(InputMode::Chat),
             input: "next message".to_string(),
+            input_cursor: 12,
             message: String::new(),
             activity_scroll: 0,
         };
@@ -1081,6 +1285,7 @@ mod tests {
         let mut overlay = UiOverlay {
             input_mode: Some(InputMode::Chat),
             input: String::new(),
+            input_cursor: 0,
             message: String::new(),
             activity_scroll: 0,
         };
