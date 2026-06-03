@@ -85,14 +85,28 @@ fn hermes_tts_audio_generation_and_playback_signal() {
 
 #[test]
 #[ignore]
-fn avu_session_log_is_created_during_live_status_probe() {
+fn avu_session_log_is_created_during_live_tui_session() {
     let evidence = prepare_evidence_dir();
-    let output = capture_command(
-        &evidence,
-        "avu-status-live.txt",
-        avu_command(&["status", "--backend", "hermes"]),
-    );
-    assert_success("avu status", &output);
+    let avu_bin = assert_cmd::cargo::cargo_bin("avu");
+    let script = r#"
+import os, pty, subprocess, time
+avu = os.environ['AVU_BIN']
+env = os.environ.copy()
+env['AVU_HOME'] = os.environ['AVU_HOME_PATH']
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvpe(avu, [avu, 'tui', '--backend', 'fake'], env)
+time.sleep(1.0)
+os.write(fd, b'q')
+_, status = os.waitpid(pid, 0)
+raise SystemExit(os.waitstatus_to_exitcode(status))
+"#;
+    let mut pty_command = command("python3", &["-c", script]);
+    pty_command
+        .env("AVU_BIN", avu_bin.as_os_str())
+        .env("AVU_HOME_PATH", AVU_HOME);
+    let output = capture_command(&evidence, "avu-tui-fake-pty.txt", pty_command);
+    assert_success("avu fake tui pty", &output);
     let logs = fs::read_dir(Path::new(AVU_HOME).join("logs"))
         .into_iter()
         .flatten()
@@ -107,6 +121,7 @@ fn avu_session_log_is_created_during_live_status_probe() {
             .join("\n"),
     )
     .expect("write log evidence");
+    assert!(!logs.is_empty(), "fake TUI session did not create Avu logs");
 }
 
 fn prepare_evidence_dir() -> PathBuf {
@@ -129,9 +144,17 @@ fn command(program: &str, args: &[&str]) -> Command {
 }
 
 fn capture_command(evidence: &Path, name: &str, mut command: Command) -> Output {
-    let output = command.output().unwrap_or_else(|error| {
-        panic!("failed to run command for {name}: {error}");
-    });
+    let output = match command.output() {
+        Ok(output) => output,
+        Err(error) => {
+            fs::write(
+                evidence.join(name),
+                format!("--- command error ---\nfailed to run command for {name}: {error}\n"),
+            )
+            .expect("write command error evidence");
+            panic!("failed to run command for {name}: {error}");
+        }
+    };
     let mut text = String::new();
     text.push_str("--- stdout ---\n");
     text.push_str(&String::from_utf8_lossy(&output.stdout));
