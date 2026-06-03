@@ -295,23 +295,6 @@ impl UiOverlay {
             .unwrap_or(self.input.len())
     }
 
-    fn visible_input(&self, max_chars: usize) -> String {
-        if max_chars == 0 {
-            return String::new();
-        }
-        let total = self.input_len();
-        if total <= max_chars {
-            return self.input.clone();
-        }
-        let half = max_chars / 2;
-        let start = self.input_cursor.saturating_sub(half);
-        let start = start.min(total.saturating_sub(max_chars));
-        let body: String = self.input.chars().skip(start).take(max_chars).collect();
-        let prefix = if start > 0 { "…" } else { "" };
-        let suffix = if start + max_chars < total { "…" } else { "" };
-        format!("{prefix}{body}{suffix}")
-    }
-
     fn visible_input_with_cursor(&self, max_chars: usize) -> String {
         let total = self.input_len();
         if total == 0 {
@@ -378,15 +361,17 @@ fn handle_input_key(
 ) -> Result<CommandAction> {
     match overlay.input_mode {
         Some(InputMode::Picker) => handle_picker_key(state, args, overlay, key_code),
-        Some(InputMode::Command) | Some(InputMode::Chat) | Some(InputMode::Slash) => handle_text_input_key(
-            state,
-            args,
-            overlay,
-            key_code,
-            prompt_tx,
-            prompt_inflight,
-            session_log,
-        ),
+        Some(InputMode::Command) | Some(InputMode::Chat) | Some(InputMode::Slash) => {
+            handle_text_input_key(
+                state,
+                args,
+                overlay,
+                key_code,
+                prompt_tx,
+                prompt_inflight,
+                session_log,
+            )
+        }
         None => Ok(CommandAction::Continue),
     }
 }
@@ -538,8 +523,7 @@ fn route_chat_input(
         return;
     }
     if *prompt_inflight {
-        overlay.message =
-            "backend still running; wait for response (draft preserved)".to_string();
+        overlay.message = "backend still running; wait for response (draft preserved)".to_string();
         return;
     }
     overlay.clear_input();
@@ -1020,13 +1004,19 @@ fn render_footer(
                         "  │ CMD[{}/{}]: {}",
                         overlay.input_cursor,
                         overlay.input_len(),
-                        overlay.visible_input(64)
+                        overlay.visible_input_with_cursor(64)
                     ),
                     InputMode::Chat => format!(
                         "  │ Chat[{}/{}]: {}",
                         overlay.input_cursor,
                         overlay.input_len(),
-                        overlay.visible_input(64)
+                        overlay.visible_input_with_cursor(64)
+                    ),
+                    InputMode::Slash => format!(
+                        "  │ Slash[{}/{}]: /{}",
+                        overlay.input_cursor,
+                        overlay.input_len(),
+                        overlay.visible_input_with_cursor(64)
                     ),
                 }
             } else if overlay.message.is_empty() {
@@ -1190,6 +1180,86 @@ mod tests {
         )
         .expect("chat mode selected");
         assert_eq!(overlay.input_mode, Some(InputMode::Chat));
+
+        overlay.input_mode = Some(InputMode::Picker);
+        handle_input_key(
+            &mut state,
+            &args,
+            &mut overlay,
+            KeyCode::Char('/'),
+            &prompt_tx,
+            &mut prompt_inflight,
+            &mut session_log,
+        )
+        .expect("slash mode selected");
+        assert_eq!(overlay.input_mode, Some(InputMode::Slash));
+        assert!(overlay.input.is_empty());
+    }
+
+    #[test]
+    fn slash_mode_routes_to_backend_cli_without_prefilled_slash() {
+        let args = TuiArgs {
+            backend: crate::cli::BackendChoice::Fake,
+            ..Default::default()
+        };
+        let mut state = CockpitState::fake_listening();
+        let mut overlay = UiOverlay {
+            input_mode: Some(InputMode::Slash),
+            input: "status --all".to_string(),
+            input_cursor: 12,
+            message: String::new(),
+            activity_scroll: 0,
+        };
+        let (prompt_tx, _prompt_rx) = mpsc::channel();
+        let mut prompt_inflight = false;
+        let mut session_log = None;
+
+        handle_input_key(
+            &mut state,
+            &args,
+            &mut overlay,
+            KeyCode::Enter,
+            &prompt_tx,
+            &mut prompt_inflight,
+            &mut session_log,
+        )
+        .expect("slash command routes");
+
+        assert_eq!(overlay.input_mode, Some(InputMode::Slash));
+        assert!(overlay.input.is_empty());
+        assert!(!prompt_inflight);
+        assert!(overlay.message.contains("backend cli failed"));
+        assert!(state.events.iter().any(|event| {
+            event.kind == EventKind::Warning && event.label.contains("backend-cli: /status --all")
+        }));
+    }
+
+    #[test]
+    fn footer_renders_visible_cursor_for_text_modes() {
+        let state = CockpitState::fake_listening();
+        let overlay = UiOverlay {
+            input_mode: Some(InputMode::Slash),
+            input: "status --all".to_string(),
+            input_cursor: 6,
+            message: String::new(),
+            activity_scroll: 0,
+        };
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| render_with_overlay(frame, &state, Some(&overlay)))
+            .expect("draw overlay");
+        let buffer = terminal.backend().buffer();
+        let mut output = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                output.push_str(buffer[(x, y)].symbol());
+            }
+            output.push('\n');
+        }
+
+        assert!(output.contains("Slash[6/12]: /status▌ --all"));
     }
 
     #[test]
@@ -1337,7 +1407,8 @@ mod tests {
         .expect("busy backend keeps draft");
 
         assert_eq!(overlay.input, "next message");
-        assert!(overlay.message.contains("already waiting"));
+        assert!(overlay.message.contains("backend still running"));
+        assert!(overlay.message.contains("draft preserved"));
     }
 
     #[test]

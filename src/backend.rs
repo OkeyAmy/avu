@@ -713,6 +713,30 @@ mod tests {
     }
 
     #[test]
+    fn backend_cli_args_preserve_quotes_flags_and_slashes() {
+        let args = split_command_args(r#"status --all --profile "portal user" '/tts say hi'"#)
+            .expect("quoted backend args parse");
+
+        assert_eq!(
+            args,
+            vec![
+                "status".to_string(),
+                "--all".to_string(),
+                "--profile".to_string(),
+                "portal user".to_string(),
+                "/tts say hi".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn backend_cli_args_reject_unterminated_quotes() {
+        let error = split_command_args("status --profile \"portal").expect_err("quote should fail");
+
+        assert!(error.contains("unterminated quote"));
+    }
+
+    #[test]
     fn summarize_output_extracts_backend_media_path() {
         let output = std::process::Output {
             status: success_status(),
