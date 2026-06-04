@@ -1,4 +1,5 @@
 use crate::{
+    backend_events::BackendTurnRequest,
     cli::BackendChoice,
     domain::{CapabilitySnapshot, CockpitState},
     runtime,
@@ -10,8 +11,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    thread,
-    time::{Duration, SystemTime},
+    time::SystemTime,
 };
 
 pub trait BackendAdapter {
@@ -19,6 +19,10 @@ pub trait BackendAdapter {
     fn probe(&self) -> CapabilitySnapshot;
     fn cockpit_state(&self) -> CockpitState;
     fn route_prompt(&self, prompt: &str) -> BackendCommandResult;
+
+    fn route_turn(&self, request: &BackendTurnRequest) -> BackendCommandResult {
+        self.route_prompt(&request.backend_prompt())
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -112,7 +116,7 @@ impl BackendAdapter for OpenClawBackend {
     }
 
     fn route_prompt(&self, prompt: &str) -> BackendCommandResult {
-        run_command_prompt("openclaw", &["agent", "--message", prompt], None)
+        run_backend_prompt("openclaw", prompt)
     }
 }
 
@@ -200,14 +204,8 @@ fn run_backend_prompt(command: &str, prompt: &str) -> BackendCommandResult {
 
     let before_audio = latest_backend_audio(command);
 
-    let result = match command {
-        "hermes" => run_command_prompt(
-            command,
-            &["--continue", "avu-tui", "--oneshot", prompt],
-            before_audio.as_ref(),
-        ),
-        other => run_command_prompt(other, &[prompt], before_audio.as_ref()),
-    };
+    let args = backend_prompt_args(command, prompt);
+    let result = run_command_prompt(command, &args, before_audio.as_ref());
 
     let after_audio = latest_backend_audio(command);
     let new_audio = result
@@ -229,6 +227,14 @@ fn run_backend_prompt(command: &str, prompt: &str) -> BackendCommandResult {
         }
     } else {
         result
+    }
+}
+
+fn backend_prompt_args<'a>(command: &str, prompt: &'a str) -> Vec<&'a str> {
+    match command {
+        "hermes" => vec!["--continue", "avu-tui", "--oneshot", prompt],
+        "openclaw" => vec!["agent", "--message", prompt],
+        _ => vec![prompt],
     }
 }
 
@@ -258,65 +264,6 @@ pub fn run_shell_command(command: &str) -> BackendCommandResult {
     };
 
     summarize_output(output)
-}
-
-pub fn run_backend_cli_command(choice: BackendChoice, command_text: &str) -> BackendCommandResult {
-    let command_text = command_text.trim().trim_start_matches('/').trim();
-    if command_text.is_empty() {
-        return BackendCommandResult::failed("empty backend command");
-    }
-    let backend = adapter_for(choice);
-    let label = backend.label();
-    if !matches!(label, "hermes" | "openclaw") {
-        return BackendCommandResult::failed("backend CLI command requires Hermes or OpenClaw");
-    }
-    if !command_exists(label) {
-        return BackendCommandResult::failed(format!("{label} command was not found on PATH"));
-    }
-    let args = match split_command_args(command_text) {
-        Ok(args) => args,
-        Err(error) => return BackendCommandResult::failed(error),
-    };
-    if args.is_empty() {
-        return BackendCommandResult::failed("empty backend command");
-    }
-    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    run_command_prompt(label, &arg_refs, None)
-}
-
-fn split_command_args(input: &str) -> std::result::Result<Vec<String>, String> {
-    let mut args = Vec::new();
-    let mut current = String::new();
-    let mut quote = None;
-    let mut escape = false;
-    for ch in input.chars() {
-        if escape {
-            current.push(ch);
-            escape = false;
-            continue;
-        }
-        match ch {
-            '\\' => escape = true,
-            '\'' | '"' if quote == Some(ch) => quote = None,
-            '\'' | '"' if quote.is_none() => quote = Some(ch),
-            ch if ch.is_whitespace() && quote.is_none() => {
-                if !current.is_empty() {
-                    args.push(std::mem::take(&mut current));
-                }
-            }
-            ch => current.push(ch),
-        }
-    }
-    if escape {
-        current.push('\\');
-    }
-    if quote.is_some() {
-        return Err("unterminated quote in backend command".to_string());
-    }
-    if !current.is_empty() {
-        args.push(current);
-    }
-    Ok(args)
 }
 
 pub fn run_voice_session(choice: BackendChoice) -> BackendCommandResult {
@@ -488,14 +435,9 @@ fn play_audio(path: &Path) -> Option<String> {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        match command.spawn() {
-            Ok(mut child) => {
-                let player = (*program).to_string();
-                thread::spawn(move || {
-                    let _ = child.wait();
-                });
-                return Some(format!("started with {player}"));
-            }
+        match command.status() {
+            Ok(status) if status.success() => return Some(format!("played with {program}")),
+            Ok(status) => return Some(format!("{program} exited with {status}")),
             Err(_) => continue,
         }
     }
@@ -535,7 +477,7 @@ fn play_audio_with_alsa_hardware(path: &Path) -> Option<String> {
                 playable_path.clone().into(),
             ],
         ) {
-            return Some(format!("started with aplay {device}"));
+            return Some(format!("played with aplay {device}"));
         }
     }
     None
@@ -605,20 +547,10 @@ fn spawn_checked_audio_player(program: &str, args: &[OsString]) -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let Ok(mut child) = command.spawn() else {
-        return false;
-    };
-    thread::sleep(Duration::from_millis(300));
-    match child.try_wait() {
-        Ok(Some(status)) => status.success(),
-        Ok(None) => {
-            thread::spawn(move || {
-                let _ = child.wait();
-            });
-            true
-        }
-        Err(_) => false,
-    }
+    command
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
@@ -695,6 +627,30 @@ mod tests {
     }
 
     #[test]
+    fn fake_backend_routes_voice_turn_with_context_without_filtering_tools() {
+        let request = BackendTurnRequest::voice("/tools then use browser and terminal", "voice-1");
+
+        let result = FakeBackend.route_turn(&request);
+
+        assert!(result.ok);
+        assert!(result.summary.contains("voice_mode=\"true\""));
+        assert!(
+            result
+                .summary
+                .contains("/tools then use browser and terminal")
+        );
+        assert!(result.summary.contains("Keep full Hermes/OpenClaw tool"));
+    }
+
+    #[test]
+    fn openclaw_prompt_uses_agent_message_args_for_shared_audio_path() {
+        assert_eq!(
+            backend_prompt_args("openclaw", "/status --all"),
+            vec!["agent", "--message", "/status --all"]
+        );
+    }
+
+    #[test]
     fn missing_backend_rejects_prompt_routing() {
         let result = MissingBackend.route_prompt("/voice");
         assert!(!result.ok);
@@ -713,30 +669,6 @@ mod tests {
     }
 
     #[test]
-    fn backend_cli_args_preserve_quotes_flags_and_slashes() {
-        let args = split_command_args(r#"status --all --profile "portal user" '/tts say hi'"#)
-            .expect("quoted backend args parse");
-
-        assert_eq!(
-            args,
-            vec![
-                "status".to_string(),
-                "--all".to_string(),
-                "--profile".to_string(),
-                "portal user".to_string(),
-                "/tts say hi".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn backend_cli_args_reject_unterminated_quotes() {
-        let error = split_command_args("status --profile \"portal").expect_err("quote should fail");
-
-        assert!(error.contains("unterminated quote"));
-    }
-
-    #[test]
     fn summarize_output_extracts_backend_media_path() {
         let output = std::process::Output {
             status: success_status(),
@@ -749,6 +681,25 @@ mod tests {
         assert!(result.ok);
         assert_eq!(result.summary, "backend generated audio");
         assert_eq!(result.audio_path, Some(PathBuf::from("/tmp/avu-voice.ogg")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn checked_audio_player_waits_for_process_exit() {
+        let temp = tempfile::NamedTempFile::new().expect("temp marker");
+        let marker = temp.path().to_path_buf();
+        std::fs::remove_file(&marker).expect("remove marker before command");
+        let script = format!("sleep 0.4; printf done > {}", marker.display());
+
+        assert!(spawn_checked_audio_player(
+            "sh",
+            &[OsString::from("-c"), OsString::from(script)]
+        ));
+
+        assert_eq!(
+            std::fs::read_to_string(marker).expect("player command completed before return"),
+            "done"
+        );
     }
 
     #[test]

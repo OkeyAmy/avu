@@ -25,12 +25,26 @@ pub enum ApprovalGate {
 }
 
 pub fn parse_intent(input: &str) -> Intent {
+    let parsed = parse_intent_with_wake_phrase(input, "hey avu");
+    if matches!(parsed, Intent::Unknown(_)) {
+        parse_intent_with_wake_phrase(input, "avu")
+    } else {
+        parsed
+    }
+}
+
+pub fn parse_intent_with_wake_phrase(input: &str, wake_phrase: &str) -> Intent {
+    let without_wake = strip_wake_phrase(input.trim(), wake_phrase);
     let normalized = input
         .trim()
         .to_lowercase()
         .replace([',', '.'], "")
-        .replace("hey avu", "")
-        .replace("avu", "")
+        .trim()
+        .to_string();
+    let normalized = without_wake
+        .unwrap_or(normalized.as_str())
+        .to_lowercase()
+        .replace([',', '.'], "")
         .trim()
         .to_string();
 
@@ -52,6 +66,25 @@ pub fn parse_intent(input: &str) -> Intent {
             Intent::SwitchSession(number)
         }
         _ => Intent::Unknown(normalized),
+    }
+}
+
+fn strip_wake_phrase<'a>(input: &'a str, wake_phrase: &str) -> Option<&'a str> {
+    let phrase = wake_phrase.trim();
+    if phrase.is_empty() {
+        return None;
+    }
+    let lower_input = input.to_lowercase();
+    let lower_phrase = phrase.to_lowercase();
+    let rest = lower_input.strip_prefix(&lower_phrase)?;
+    if rest.is_empty() {
+        return Some("");
+    }
+    let first = rest.chars().next()?;
+    if first.is_whitespace() || matches!(first, ',' | '.' | ':' | ';' | '!' | '?') {
+        Some(&input[phrase.len()..])
+    } else {
+        None
     }
 }
 
@@ -105,6 +138,18 @@ mod tests {
     fn parses_wake_prefixed_commands() {
         assert_eq!(parse_intent("Hey Avu, interrupt"), Intent::Interrupt);
         assert_eq!(parse_intent("avu confirm approve"), Intent::ConfirmApprove);
+    }
+
+    #[test]
+    fn parses_configured_wake_phrase_commands() {
+        assert_eq!(
+            parse_intent_with_wake_phrase("Computer, status", "computer"),
+            Intent::Status
+        );
+        assert_eq!(
+            parse_intent_with_wake_phrase("Computerized status", "computer"),
+            Intent::Unknown("computerized status".to_string())
+        );
     }
 
     #[test]

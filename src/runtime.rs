@@ -1,7 +1,11 @@
-use crate::domain::{BackendKind, CockpitEvent, EventKind, PermissionPosture};
+use crate::{
+    backend_events::{classify_backend_event, event_kind_for_class},
+    domain::{BackendKind, CockpitEvent, EventKind, PermissionPosture},
+    gateway,
+};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde_json::Value;
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{env, ffi::OsString, fs, path::PathBuf, process::Command};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reported<T> {
@@ -70,7 +74,10 @@ pub fn hermes_snapshot(command_exists: bool) -> RuntimeSnapshot {
             "Hermes status JSON unavailable; capability detection is degraded until Hermes exposes machine-readable status".to_string(),
         );
     }
-    notes.extend(hermes_gateway_notes(gateway_text.as_deref()));
+    notes.extend(hermes_gateway_notes(
+        gateway_text.as_deref(),
+        hermes_default_profile(config_text.as_deref()).as_deref(),
+    ));
 
     RuntimeSnapshot {
         backend: BackendKind::Hermes,
@@ -254,7 +261,13 @@ fn parse_hermes_log_line(line: &str) -> Option<CockpitEvent> {
 
     let lower = rest.to_lowercase();
 
-    if lower.contains("voice recording")
+    if let Some(class) = classify_backend_event(rest) {
+        Some(CockpitEvent {
+            at,
+            kind: event_kind_for_class(&class),
+            label: rest.to_string(),
+        })
+    } else if lower.contains("voice recording")
         || lower.contains("recording started")
         || lower.contains("listening")
         || lower.contains("awaiting audio")
@@ -408,7 +421,11 @@ fn parse_openclaw_log_json(json: &Value) -> Option<CockpitEvent> {
     let lower_type = type_field.unwrap_or("").to_lowercase();
 
     // Map based on OpenClaw event types
-    let kind = if lower_type.contains("session.tool") && lower_msg.contains("start") {
+    let kind = if lower_type.contains("session.message") && lower_msg.contains("response") {
+        EventKind::ResponseStream
+    } else if let Some(class) = classify_backend_event(&format!("{lower_type} {lower_msg}")) {
+        event_kind_for_class(&class)
+    } else if lower_type.contains("session.tool") && lower_msg.contains("start") {
         EventKind::ToolStart
     } else if lower_type.contains("session.tool")
         && (lower_msg.contains("finish")
@@ -420,8 +437,6 @@ fn parse_openclaw_log_json(json: &Value) -> Option<CockpitEvent> {
         EventKind::ToolStart
     } else if lower_type.contains("approval") || lower_msg.contains("approval") {
         EventKind::ApprovalRequested
-    } else if lower_type.contains("session.message") && lower_msg.contains("response") {
-        EventKind::ResponseStream
     } else if lower_type.contains("session") {
         EventKind::Processing
     } else if lower_type.contains("health") || lower_type.contains("heartbeat") {
@@ -589,12 +604,13 @@ fn model_from_status_text(status_text: Option<&str>) -> Option<String> {
     None
 }
 
-fn hermes_gateway_notes(gateway_text: Option<&str>) -> Vec<String> {
+fn hermes_gateway_notes(gateway_text: Option<&str>, default_profile: Option<&str>) -> Vec<String> {
     let Some(text) = gateway_text else {
         return vec!["Hermes gateway status unavailable; run `hermes gateway status` to inspect messaging backends".to_string()];
     };
+    let resolution = gateway::resolve_hermes_gateway(default_profile, Some(text));
     let lower = text.to_lowercase();
-    let mut notes = Vec::new();
+    let mut notes = resolution.notes;
     let auto_restarting = lower.contains("activating (auto-restart)")
         || lower.contains("restart pending")
         || lower.contains("auto-restart");
@@ -649,10 +665,32 @@ fn running_gateway_profile(gateway_text: &str) -> Option<String> {
     })
 }
 
-fn hermes_config_text() -> Option<String> {
-    let home = env::var_os("HOME")?;
-    let path = std::path::PathBuf::from(home).join(".hermes/config.yaml");
-    fs::read_to_string(path).ok()
+pub fn hermes_config_text() -> Option<String> {
+    hermes_config_candidates(env::var_os("HERMES_HOME"), env::var_os("HOME"))
+        .into_iter()
+        .find_map(|path| fs::read_to_string(path).ok())
+}
+
+fn hermes_config_candidates(hermes_home: Option<OsString>, home: Option<OsString>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(home) = hermes_home {
+        candidates.push(PathBuf::from(home).join("config.yaml"));
+    }
+    if let Some(home) = home {
+        candidates.push(PathBuf::from(home).join(".hermes/config.yaml"));
+    }
+    candidates
+}
+
+fn hermes_default_profile(config_text: Option<&str>) -> Option<String> {
+    env::var("HERMES_PROFILE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| yaml_section_value(config_text?, "profile", "default"))
+        .or_else(|| yaml_section_value(config_text?, "profiles", "default"))
+        .or_else(|| yaml_top_level_value(config_text?, "profile"))
+        .or_else(|| yaml_top_level_value(config_text?, "default_profile"))
 }
 
 fn voice_from_hermes_config(config_text: Option<&str>) -> Reported<String> {
@@ -714,6 +752,24 @@ fn yaml_section_value(text: &str, section: &str, key: &str) -> Option<String> {
             && line.starts_with("  ")
             && !line.starts_with("    ")
             && let Some((candidate, value)) = trimmed.split_once(':')
+            && candidate.trim() == key
+        {
+            return clean_yaml_value(value);
+        }
+    }
+    None
+}
+
+fn yaml_top_level_value(text: &str, key: &str) -> Option<String> {
+    for line in text.lines() {
+        if line.starts_with(' ') {
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((candidate, value)) = trimmed.split_once(':')
             && candidate.trim() == key
         {
             return clean_yaml_value(value);
@@ -845,7 +901,7 @@ Recent gateway health:
 Other profiles:
   ✓ portal           — PID 741
 "#;
-        let notes = hermes_gateway_notes(Some(status));
+        let notes = hermes_gateway_notes(Some(status), Some("default"));
         assert!(
             notes
                 .iter()
@@ -867,7 +923,7 @@ Recent gateway health:
 Other profiles:
   ✓ portal           — PID 115002
 "#;
-        let notes = hermes_gateway_notes(Some(status));
+        let notes = hermes_gateway_notes(Some(status), Some("default"));
         assert!(notes.iter().any(|note| note.contains("last startup issue")));
         assert!(
             notes
@@ -878,8 +934,43 @@ Other profiles:
 
     #[test]
     fn gateway_notes_detect_running_service() {
-        let notes = hermes_gateway_notes(Some("✓ User gateway service is running"));
-        assert_eq!(notes, vec!["Hermes gateway service is running".to_string()]);
+        let notes =
+            hermes_gateway_notes(Some("✓ User gateway service is running"), Some("default"));
+        assert!(
+            notes
+                .iter()
+                .any(|note| note == "Hermes default gateway is running")
+        );
+    }
+
+    #[test]
+    fn default_profile_can_come_from_hermes_config() {
+        let config = r#"
+profile: default
+tts:
+  provider: gemini
+"#;
+
+        assert_eq!(
+            hermes_default_profile(Some(config)),
+            Some("default".to_string())
+        );
+    }
+
+    #[test]
+    fn hermes_config_candidates_prefer_hermes_home() {
+        let candidates = hermes_config_candidates(
+            Some(OsString::from("/tmp/hermes-custom")),
+            Some(OsString::from("/home/user")),
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/tmp/hermes-custom/config.yaml"),
+                PathBuf::from("/home/user/.hermes/config.yaml"),
+            ]
+        );
     }
 
     #[test]
@@ -923,6 +1014,20 @@ Other profiles:
         let line = "2026-06-01 17:33:44,018 INFO tools.voice_mode: TTS audio playback started with gemini voice Kore";
         let event = parse_hermes_log_line(line);
         assert_eq!(event.as_ref().unwrap().kind, EventKind::Speaking);
+    }
+
+    #[test]
+    fn parses_hermes_tts_end_as_listening() {
+        let line = "2026-06-01 17:33:45,018 INFO tools.voice_mode: audio playback ended; ready for next turn";
+        let event = parse_hermes_log_line(line);
+        assert_eq!(event.as_ref().unwrap().kind, EventKind::Listening);
+    }
+
+    #[test]
+    fn parses_hermes_turn_complete_as_response() {
+        let line = "2026-06-01 17:33:45,018 INFO agent: final response ready for turn voice-1";
+        let event = parse_hermes_log_line(line);
+        assert_eq!(event.as_ref().unwrap().kind, EventKind::ResponseStream);
     }
 
     #[test]
@@ -979,5 +1084,27 @@ Other profiles:
         let event = parse_openclaw_log_json(&json);
         assert!(event.is_some());
         assert_eq!(event.unwrap().kind, EventKind::ApprovalRequested);
+    }
+
+    #[test]
+    fn parses_openclaw_audio_end_as_listening() {
+        let json: Value = serde_json::from_str(
+            r#"{"timestamp":"2026-06-01T12:00:12.000Z","level":"info","message":"audio playback ended; ready for next turn","type":"session.audio"}"#,
+        )
+        .unwrap();
+        let event = parse_openclaw_log_json(&json);
+        assert!(event.is_some());
+        assert_eq!(event.unwrap().kind, EventKind::Listening);
+    }
+
+    #[test]
+    fn parses_openclaw_session_message_response_before_generic_session_progress() {
+        let json: Value = serde_json::from_str(
+            r#"{"timestamp":"2026-06-01T12:00:13.000Z","level":"info","message":"response complete","type":"session.message"}"#,
+        )
+        .unwrap();
+        let event = parse_openclaw_log_json(&json);
+        assert!(event.is_some());
+        assert_eq!(event.unwrap().kind, EventKind::ResponseStream);
     }
 }
