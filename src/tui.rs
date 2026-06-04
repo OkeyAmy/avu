@@ -1,4 +1,7 @@
-use crate::{backend, cli::TuiArgs, domain::*, engine, hud, intent};
+use crate::{
+    backend, backend_events::BackendTurnRequest, cli::TuiArgs, config, domain::*, engine, hud,
+    intent, runtime, voice_activation,
+};
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -89,18 +92,7 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
             prompt_inflight = false;
             match result {
                 Ok(cmd_result) => {
-                    let kind = if cmd_result.ok {
-                        EventKind::ResponseStream
-                    } else {
-                        EventKind::Warning
-                    };
-                    let label = format!("backend: {}", cmd_result.summary);
-                    push_operator_event(&mut state, kind, &label, &mut session_log);
-                    overlay.message = if cmd_result.ok {
-                        format!("backend replied: {}", compact(&cmd_result.summary, 48))
-                    } else {
-                        format!("backend failed: {}", compact(&cmd_result.summary, 48))
-                    };
+                    apply_prompt_result(&mut state, &mut overlay, cmd_result, &mut session_log);
                     if !refresh_inflight {
                         spawn_refresh(&args, &refresh_tx);
                         refresh_inflight = true;
@@ -177,11 +169,39 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
                     last_refresh = Instant::now();
                     overlay.message = "refreshing backend status...".to_string();
                 }
+                KeyCode::Char('w') => {
+                    arm_keyboard_wake(&mut state, &mut overlay, &mut session_log);
+                }
                 KeyCode::Up if !overlay.is_typing() => {
                     overlay.activity_scroll = overlay.activity_scroll.saturating_add(1);
                 }
                 KeyCode::Down if !overlay.is_typing() => {
                     overlay.activity_scroll = overlay.activity_scroll.saturating_sub(1);
+                }
+                KeyCode::Char('a') if state.pending_approval.is_some() => {
+                    arm_approval(&state, &args, &mut overlay);
+                }
+                KeyCode::Char('A') if state.pending_approval.is_some() => {
+                    route_approval_response(
+                        &mut state,
+                        &args,
+                        &mut overlay,
+                        &prompt_tx,
+                        &mut prompt_inflight,
+                        &mut session_log,
+                        "approve",
+                    );
+                }
+                KeyCode::Char('r') if state.pending_approval.is_some() => {
+                    route_approval_response(
+                        &mut state,
+                        &args,
+                        &mut overlay,
+                        &prompt_tx,
+                        &mut prompt_inflight,
+                        &mut session_log,
+                        "reject",
+                    );
                 }
                 KeyCode::Char('i') => {
                     push_operator_event(
@@ -195,7 +215,7 @@ fn run_interactive(args: TuiArgs) -> Result<()> {
                     push_operator_event(
                         &mut state,
                         EventKind::Listening,
-                        "voice status requested; use :/voice, :/tts, or :/stt to route through backend",
+                        "voice status requested; use w to arm keyboard wake or Ctrl+B for Hermes mic voice mode",
                         &mut session_log,
                     );
                 }
@@ -228,6 +248,7 @@ struct UiOverlay {
     input_cursor: usize,
     message: String,
     activity_scroll: usize,
+    approval_armed_id: Option<String>,
 }
 
 impl UiOverlay {
@@ -399,7 +420,7 @@ fn handle_picker_key(
         KeyCode::Char('/') => {
             overlay.input_mode = Some(InputMode::Slash);
             overlay.clear_input();
-            overlay.message = "Backend CLI mode: type e.g. status --all".to_string();
+            overlay.message = "Slash mode: type backend slash command, e.g. voice on".to_string();
         }
         KeyCode::Char('s') => {
             refresh_state(state, args)?;
@@ -436,8 +457,15 @@ fn handle_text_input_key(
                 prompt_tx,
                 prompt_inflight,
                 session_log,
-            ),
-            Some(InputMode::Slash) => run_backend_cli_input(state, args, overlay, session_log),
+            )?,
+            Some(InputMode::Slash) => route_slash_input(
+                state,
+                args,
+                overlay,
+                prompt_tx,
+                prompt_inflight,
+                session_log,
+            )?,
             _ => {}
         },
         KeyCode::PageUp => {
@@ -485,27 +513,151 @@ fn run_shell_input(
     };
 }
 
-fn run_backend_cli_input(
+fn route_slash_input(
     state: &mut CockpitState,
     args: &TuiArgs,
     overlay: &mut UiOverlay,
+    prompt_tx: &PromptSender,
+    prompt_inflight: &mut bool,
+    session_log: &mut Option<fs::File>,
+) -> Result<()> {
+    let command = overlay.input.trim().trim_start_matches('/').trim();
+    if command.is_empty() {
+        overlay.clear_input();
+        overlay.message = "empty slash command, cancelled".to_string();
+    } else {
+        overlay.input = format!("/{command}");
+        overlay.input_cursor = overlay.input_len();
+        route_chat_input(
+            state,
+            args,
+            overlay,
+            prompt_tx,
+            prompt_inflight,
+            session_log,
+        )?;
+    }
+    Ok(())
+}
+
+fn arm_keyboard_wake(
+    state: &mut CockpitState,
+    overlay: &mut UiOverlay,
     session_log: &mut Option<fs::File>,
 ) {
-    let command = overlay.input.trim().to_string();
-    overlay.clear_input();
-    let result = backend::run_backend_cli_command(args.backend, &command);
-    let kind = if result.ok {
-        EventKind::ResponseStream
-    } else {
-        EventKind::Warning
+    let backend_voice_config = match state.backend {
+        BackendKind::Hermes => runtime::hermes_config_text(),
+        _ => None,
     };
-    let label = format!("backend-cli: /{} => {}", command, result.summary);
-    push_operator_event(state, kind, &label, session_log);
-    overlay.message = if result.ok {
-        format!("backend cli ok: {}", compact(&result.summary, 48))
+    arm_keyboard_wake_with_backend_voice_config(
+        state,
+        overlay,
+        session_log,
+        backend_voice_config.as_deref(),
+    );
+}
+
+fn arm_keyboard_wake_with_backend_voice_config(
+    state: &mut CockpitState,
+    overlay: &mut UiOverlay,
+    session_log: &mut Option<fs::File>,
+    backend_voice_config: Option<&str>,
+) {
+    let paths = config::AvuPaths::discover();
+    let avu_config = config::AvuConfig::load(&paths).unwrap_or_default();
+    let status = voice_activation::activation_status(
+        &avu_config,
+        &state.backend_label,
+        backend_voice_config,
+    );
+    let label = format!(
+        "wake: armed keyboard activation for `{}`; say/type wake-prefixed commands or press Ctrl+B for backend voice",
+        status.wake_phrase
+    );
+    push_operator_event(state, EventKind::Listening, &label, session_log);
+    overlay.message = if status.backend_voice_available {
+        format!("wake armed: {} · backend voice ready", status.wake_phrase)
     } else {
-        format!("backend cli failed: {}", compact(&result.summary, 48))
+        format!(
+            "wake armed: {} · verify backend voice with Ctrl+B",
+            status.wake_phrase
+        )
     };
+}
+
+fn arm_approval(state: &CockpitState, args: &TuiArgs, overlay: &mut UiOverlay) {
+    let Some(approval) = state.pending_approval.as_ref() else {
+        overlay.message = "no pending backend approval".to_string();
+        return;
+    };
+    if !can_route_approval(state, args) {
+        overlay.approval_armed_id = None;
+        overlay.message = "approval is observe-only for this backend".to_string();
+        return;
+    }
+    overlay.approval_armed_id = Some(approval.id.clone());
+    overlay.message = "approval armed; press A to confirm or r to reject".to_string();
+}
+
+fn can_route_approval(state: &CockpitState, args: &TuiArgs) -> bool {
+    if args.fixture.is_some() {
+        return false;
+    }
+    if state.capabilities.permission_posture != PermissionPosture::RouteApprovalResponses {
+        return false;
+    }
+    let Some(approval) = state.pending_approval.as_ref() else {
+        return false;
+    };
+    if state.backend != approval.backend {
+        return false;
+    }
+    match args.backend {
+        crate::cli::BackendChoice::Hermes => approval.backend == BackendKind::Hermes,
+        crate::cli::BackendChoice::Openclaw => approval.backend == BackendKind::OpenClaw,
+        crate::cli::BackendChoice::Fake => approval.backend == BackendKind::Fake,
+        crate::cli::BackendChoice::Auto => approval.backend == state.backend,
+        crate::cli::BackendChoice::Remote => approval.backend == BackendKind::Remote,
+    }
+}
+
+fn route_approval_response(
+    state: &mut CockpitState,
+    args: &TuiArgs,
+    overlay: &mut UiOverlay,
+    prompt_tx: &PromptSender,
+    prompt_inflight: &mut bool,
+    session_log: &mut Option<fs::File>,
+    decision: &str,
+) {
+    let Some(approval) = state.pending_approval.as_ref() else {
+        overlay.message = "no pending backend approval".to_string();
+        return;
+    };
+    if !can_route_approval(state, args) {
+        overlay.message = "approval is observe-only for this backend".to_string();
+        return;
+    }
+    if decision == "approve" && overlay.approval_armed_id.as_deref() != Some(approval.id.as_str()) {
+        overlay.message = "approval requires arming first with a".to_string();
+        return;
+    }
+    if *prompt_inflight {
+        overlay.message = "backend still running; approval response preserved".to_string();
+        return;
+    }
+    let prompt = format!("/{decision} {}", approval.id);
+    push_operator_event(
+        state,
+        EventKind::ApprovalRouted,
+        &format!("approval routed: {decision} {}", approval.id),
+        session_log,
+    );
+    state.pending_approval = None;
+    overlay.approval_armed_id = None;
+    overlay.message = format!("approval {decision} routed to backend");
+    *prompt_inflight = true;
+    spawn_prompt(args.clone(), prompt_tx.clone(), prompt);
 }
 
 fn route_chat_input(
@@ -515,16 +667,28 @@ fn route_chat_input(
     prompt_tx: &PromptSender,
     prompt_inflight: &mut bool,
     session_log: &mut Option<fs::File>,
-) {
+) -> Result<()> {
     let prompt = overlay.input.trim().to_string();
     if prompt.is_empty() {
         overlay.clear_input();
         overlay.message = "empty prompt, cancelled".to_string();
-        return;
+        return Ok(());
+    }
+    let paths = config::AvuPaths::discover();
+    let avu_config = config::AvuConfig::load(&paths).unwrap_or_default();
+    let mut wake_context = WakeIntentContext {
+        args,
+        prompt_tx,
+        prompt_inflight,
+        session_log,
+        wake_phrase: &avu_config.wake_phrase,
+    };
+    if handle_wake_intent(state, overlay, &prompt, &mut wake_context)? {
+        return Ok(());
     }
     if *prompt_inflight {
         overlay.message = "backend still running; wait for response (draft preserved)".to_string();
-        return;
+        return Ok(());
     }
     overlay.clear_input();
     push_operator_event(
@@ -536,13 +700,149 @@ fn route_chat_input(
     overlay.message = "sending to backend...".to_string();
     *prompt_inflight = true;
     spawn_prompt(args.clone(), prompt_tx.clone(), prompt);
+    Ok(())
+}
+
+struct WakeIntentContext<'a> {
+    args: &'a TuiArgs,
+    prompt_tx: &'a PromptSender,
+    prompt_inflight: &'a mut bool,
+    session_log: &'a mut Option<fs::File>,
+    wake_phrase: &'a str,
+}
+
+fn handle_wake_intent(
+    state: &mut CockpitState,
+    overlay: &mut UiOverlay,
+    prompt: &str,
+    context: &mut WakeIntentContext<'_>,
+) -> Result<bool> {
+    if !is_wake_prefixed(prompt, context.wake_phrase) {
+        return Ok(false);
+    }
+
+    let parsed = intent::parse_intent_with_wake_phrase(prompt, context.wake_phrase);
+    overlay.clear_input();
+    match parsed {
+        intent::Intent::Status => {
+            refresh_state(state, context.args)?;
+            push_operator_event(
+                state,
+                EventKind::Listening,
+                "wake intent: status refreshed",
+                context.session_log,
+            );
+            overlay.message = "wake intent: status refreshed".to_string();
+        }
+        intent::Intent::Interrupt => {
+            push_operator_event(
+                state,
+                EventKind::Warning,
+                "wake intent: interrupt requested; backend control routing not enabled yet",
+                context.session_log,
+            );
+            overlay.message =
+                "wake intent: interrupt noted; backend routing not enabled".to_string();
+        }
+        intent::Intent::Approve => {
+            arm_approval(state, context.args, overlay);
+        }
+        intent::Intent::ConfirmApprove => {
+            if let Some(approval) = state.pending_approval.as_ref() {
+                overlay.approval_armed_id = Some(approval.id.clone());
+            }
+            route_approval_response(
+                state,
+                context.args,
+                overlay,
+                context.prompt_tx,
+                context.prompt_inflight,
+                context.session_log,
+                "approve",
+            );
+        }
+        intent::Intent::Reject => {
+            route_approval_response(
+                state,
+                context.args,
+                overlay,
+                context.prompt_tx,
+                context.prompt_inflight,
+                context.session_log,
+                "reject",
+            );
+        }
+        intent::Intent::ListSessions
+        | intent::Intent::Pause
+        | intent::Intent::Resume
+        | intent::Intent::SwitchSession(_)
+        | intent::Intent::Mute => {
+            let label = format!("wake intent: {:?} is not routed by Avu yet", parsed);
+            push_operator_event(state, EventKind::Warning, &label, context.session_log);
+            overlay.message = compact(&label, 72);
+        }
+        intent::Intent::Unknown(command) => {
+            let label = format!(
+                "wake intent ignored: `{}` is not a safe Avu control command",
+                compact(&command, 48)
+            );
+            push_operator_event(state, EventKind::Warning, &label, context.session_log);
+            overlay.message = compact(&label, 72);
+        }
+    }
+    Ok(true)
+}
+
+fn is_wake_prefixed(prompt: &str, wake_phrase: &str) -> bool {
+    let lower = prompt.trim_start().to_lowercase();
+    let phrase = wake_phrase.trim().to_lowercase();
+    if phrase.is_empty() {
+        return false;
+    }
+    let Some(rest) = lower.strip_prefix(&phrase) else {
+        return false;
+    };
+    rest.is_empty()
+        || rest
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_whitespace() || matches!(ch, ',' | '.' | ':' | ';' | '!' | '?'))
 }
 
 fn spawn_prompt(args: TuiArgs, tx: PromptSender, prompt: String) {
     thread::spawn(move || {
-        let result = backend::adapter_for(args.backend).route_prompt(&prompt);
+        let request = BackendTurnRequest::text(prompt);
+        let result = backend::adapter_for(args.backend).route_turn(&request);
         let _ = tx.send(Ok(result));
     });
+}
+
+fn apply_prompt_result(
+    state: &mut CockpitState,
+    overlay: &mut UiOverlay,
+    cmd_result: backend::BackendCommandResult,
+    session_log: &mut Option<fs::File>,
+) {
+    let kind = if cmd_result.ok {
+        EventKind::ResponseStream
+    } else {
+        EventKind::Warning
+    };
+    let label = format!("backend: {}", cmd_result.summary);
+    push_operator_event(state, kind, &label, session_log);
+    if cmd_result.ok {
+        push_operator_event(
+            state,
+            EventKind::Listening,
+            "ready: listening for next turn",
+            session_log,
+        );
+    }
+    overlay.message = if cmd_result.ok {
+        format!("backend replied: {}", compact(&cmd_result.summary, 48))
+    } else {
+        format!("backend failed: {}", compact(&cmd_result.summary, 48))
+    };
 }
 
 fn run_voice_handoff(
@@ -571,15 +871,28 @@ fn refresh_state(state: &mut CockpitState, args: &TuiArgs) -> Result<()> {
 }
 
 fn apply_refreshed_state(state: &mut CockpitState, mut refreshed: CockpitState) {
+    let backend_has_active_event = refreshed.events.iter().any(is_active_backend_event);
     let local_events: Vec<CockpitEvent> = state
         .events
         .iter()
         .filter(|event| is_operator_event(&event.label))
+        .filter(|event| !(backend_has_active_event && event.label.starts_with("ready: ")))
         .cloned()
         .collect();
     refreshed.events.extend(local_events);
     keep_recent_state_events(&mut refreshed, 12);
     *state = refreshed;
+}
+
+fn is_active_backend_event(event: &CockpitEvent) -> bool {
+    matches!(
+        event.kind,
+        EventKind::Processing
+            | EventKind::ToolStart
+            | EventKind::ApprovalRequested
+            | EventKind::ApprovalRouted
+            | EventKind::Speaking
+    )
 }
 
 fn spawn_refresh(args: &TuiArgs, refresh_tx: &RefreshSender) {
@@ -596,6 +909,7 @@ fn is_operator_event(label: &str) -> bool {
         || label.starts_with("backend: ")
         || label.starts_with("backend-cli: ")
         || label.starts_with("voice: ")
+        || label.starts_with("ready: ")
         || label.starts_with("sending: ")
         || label.starts_with("Avu session ")
 }
@@ -838,7 +1152,7 @@ fn render_control_sheet(frame: &mut ratatui::Frame<'_>, area: Rect, state: &Cock
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("[s]status [:]CMD/Chat [Ctrl+B]Hermes voice [m]help [q]quit"),
+        Span::raw("[s]status [w]wake [:]CMD/Chat [Ctrl+B]Hermes voice [m]help [q]quit"),
     ])];
 
     if let Some(approval) = state.pending_approval.as_ref() {
@@ -1115,6 +1429,7 @@ mod tests {
             input_cursor: 6,
             message: String::new(),
             activity_scroll: 0,
+            approval_armed_id: None,
         };
         let (prompt_tx, _prompt_rx) = mpsc::channel();
         let mut prompt_inflight = false;
@@ -1151,6 +1466,7 @@ mod tests {
             input_cursor: 0,
             message: String::new(),
             activity_scroll: 0,
+            approval_armed_id: None,
         };
         let (prompt_tx, _prompt_rx) = mpsc::channel();
         let mut prompt_inflight = false;
@@ -1194,10 +1510,11 @@ mod tests {
         .expect("slash mode selected");
         assert_eq!(overlay.input_mode, Some(InputMode::Slash));
         assert!(overlay.input.is_empty());
+        assert!(overlay.message.contains("Slash mode"));
     }
 
     #[test]
-    fn slash_mode_routes_to_backend_cli_without_prefilled_slash() {
+    fn slash_mode_routes_raw_slash_prompt_to_backend() {
         let args = TuiArgs {
             backend: crate::cli::BackendChoice::Fake,
             ..Default::default()
@@ -1209,6 +1526,7 @@ mod tests {
             input_cursor: 12,
             message: String::new(),
             activity_scroll: 0,
+            approval_armed_id: None,
         };
         let (prompt_tx, _prompt_rx) = mpsc::channel();
         let mut prompt_inflight = false;
@@ -1227,10 +1545,295 @@ mod tests {
 
         assert_eq!(overlay.input_mode, Some(InputMode::Slash));
         assert!(overlay.input.is_empty());
-        assert!(!prompt_inflight);
-        assert!(overlay.message.contains("backend cli failed"));
+        assert!(prompt_inflight);
+        assert!(overlay.message.contains("sending to backend"));
         assert!(state.events.iter().any(|event| {
-            event.kind == EventKind::Warning && event.label.contains("backend-cli: /status --all")
+            event.kind == EventKind::Processing && event.label.contains("sending: /status --all")
+        }));
+    }
+
+    #[test]
+    fn wake_status_intent_refreshes_locally_without_backend_prompt() {
+        let args = TuiArgs {
+            backend: crate::cli::BackendChoice::Fake,
+            ..Default::default()
+        };
+        let mut state = CockpitState::fake_listening();
+        state.events.clear();
+        let mut overlay = UiOverlay {
+            input_mode: Some(InputMode::Chat),
+            input: "Hey Avu, status".to_string(),
+            input_cursor: 15,
+            message: String::new(),
+            activity_scroll: 0,
+            approval_armed_id: None,
+        };
+        let (prompt_tx, prompt_rx) = mpsc::channel();
+        let mut prompt_inflight = false;
+        let mut session_log = None;
+
+        handle_input_key(
+            &mut state,
+            &args,
+            &mut overlay,
+            KeyCode::Enter,
+            &prompt_tx,
+            &mut prompt_inflight,
+            &mut session_log,
+        )
+        .expect("wake status routes locally");
+
+        assert!(!prompt_inflight);
+        assert!(prompt_rx.try_recv().is_err());
+        assert!(overlay.input.is_empty());
+        assert!(overlay.message.contains("status refreshed"));
+        assert!(state.events.iter().any(|event| {
+            event.kind == EventKind::Listening && event.label == "wake intent: status refreshed"
+        }));
+    }
+
+    #[test]
+    fn unknown_wake_intent_is_not_sent_to_backend() {
+        let args = TuiArgs {
+            backend: crate::cli::BackendChoice::Fake,
+            ..Default::default()
+        };
+        let mut state = CockpitState::fake_listening();
+        state.events.clear();
+        let mut overlay = UiOverlay {
+            input_mode: Some(InputMode::Chat),
+            input: "Hey Avu, write arbitrary backend prompt".to_string(),
+            input_cursor: 39,
+            message: String::new(),
+            activity_scroll: 0,
+            approval_armed_id: None,
+        };
+        let (prompt_tx, prompt_rx) = mpsc::channel();
+        let mut prompt_inflight = false;
+        let mut session_log = None;
+
+        handle_input_key(
+            &mut state,
+            &args,
+            &mut overlay,
+            KeyCode::Enter,
+            &prompt_tx,
+            &mut prompt_inflight,
+            &mut session_log,
+        )
+        .expect("unknown wake intent is handled locally");
+
+        assert!(!prompt_inflight);
+        assert!(prompt_rx.try_recv().is_err());
+        assert!(overlay.message.contains("wake intent ignored"));
+        assert!(state.events.iter().any(|event| {
+            event.kind == EventKind::Warning && event.label.contains("wake intent ignored")
+        }));
+    }
+
+    #[test]
+    fn configured_wake_phrase_routes_through_intent_layer() {
+        let args = TuiArgs {
+            backend: crate::cli::BackendChoice::Fake,
+            ..Default::default()
+        };
+        let mut state = CockpitState::fake_listening();
+        state.events.clear();
+        let mut overlay = UiOverlay {
+            input_mode: Some(InputMode::Chat),
+            input: "Computer, status".to_string(),
+            input_cursor: 16,
+            message: String::new(),
+            activity_scroll: 0,
+            approval_armed_id: None,
+        };
+        let (prompt_tx, prompt_rx) = mpsc::channel();
+        let mut prompt_inflight = false;
+        let mut session_log = None;
+        let prompt = overlay.input.clone();
+        let mut context = WakeIntentContext {
+            args: &args,
+            prompt_tx: &prompt_tx,
+            prompt_inflight: &mut prompt_inflight,
+            session_log: &mut session_log,
+            wake_phrase: "computer",
+        };
+
+        assert!(
+            handle_wake_intent(&mut state, &mut overlay, &prompt, &mut context)
+                .expect("configured wake phrase routes")
+        );
+
+        assert!(!prompt_inflight);
+        assert!(prompt_rx.try_recv().is_err());
+        assert!(overlay.message.contains("status refreshed"));
+        assert!(state.events.iter().any(|event| {
+            event.kind == EventKind::Listening && event.label == "wake intent: status refreshed"
+        }));
+    }
+
+    #[test]
+    fn approval_keys_route_structured_pending_approval_to_backend() {
+        let args = TuiArgs {
+            backend: crate::cli::BackendChoice::Hermes,
+            ..Default::default()
+        };
+        let mut state = CockpitState::fake_listening();
+        state.backend = BackendKind::Hermes;
+        if let Some(approval) = state.pending_approval.as_mut() {
+            approval.backend = BackendKind::Hermes;
+        }
+        let mut overlay = UiOverlay::default();
+        let (prompt_tx, _prompt_rx) = mpsc::channel();
+        let mut prompt_inflight = false;
+        let mut session_log = None;
+
+        route_approval_response(
+            &mut state,
+            &args,
+            &mut overlay,
+            &prompt_tx,
+            &mut prompt_inflight,
+            &mut session_log,
+            "approve",
+        );
+
+        assert!(!prompt_inflight);
+        assert!(state.pending_approval.is_some());
+        assert!(overlay.message.contains("requires arming"));
+
+        arm_approval(&state, &args, &mut overlay);
+        assert_eq!(
+            overlay.approval_armed_id.as_deref(),
+            Some("approval-fixture-001")
+        );
+
+        route_approval_response(
+            &mut state,
+            &args,
+            &mut overlay,
+            &prompt_tx,
+            &mut prompt_inflight,
+            &mut session_log,
+            "approve",
+        );
+
+        assert!(prompt_inflight);
+        assert!(state.pending_approval.is_none());
+        assert!(overlay.message.contains("approval approve routed"));
+        assert!(state.events.iter().any(|event| {
+            event.kind == EventKind::ApprovalRouted && event.label.contains("approval-fixture-001")
+        }));
+    }
+
+    #[test]
+    fn approval_routing_rejects_mismatched_backend_source() {
+        let args = TuiArgs {
+            backend: crate::cli::BackendChoice::Hermes,
+            ..Default::default()
+        };
+        let mut state = CockpitState::fake_listening();
+        let mut overlay = UiOverlay::default();
+        let (prompt_tx, _prompt_rx) = mpsc::channel();
+        let mut prompt_inflight = false;
+        let mut session_log = None;
+
+        arm_approval(&state, &args, &mut overlay);
+        route_approval_response(
+            &mut state,
+            &args,
+            &mut overlay,
+            &prompt_tx,
+            &mut prompt_inflight,
+            &mut session_log,
+            "approve",
+        );
+
+        assert!(!prompt_inflight);
+        assert!(state.pending_approval.is_some());
+        assert!(overlay.message.contains("observe-only"));
+    }
+
+    #[test]
+    fn approval_routing_rejects_fixture_spoofing_live_backend() {
+        let args = TuiArgs {
+            backend: crate::cli::BackendChoice::Hermes,
+            fixture: Some(std::path::PathBuf::from(
+                "fixtures/approval_destructive.json",
+            )),
+            ..Default::default()
+        };
+        let mut state = CockpitState::fake_listening();
+        state.backend = BackendKind::Hermes;
+        if let Some(approval) = state.pending_approval.as_mut() {
+            approval.backend = BackendKind::Hermes;
+        }
+        let mut overlay = UiOverlay::default();
+        let (prompt_tx, _prompt_rx) = mpsc::channel();
+        let mut prompt_inflight = false;
+        let mut session_log = None;
+
+        arm_approval(&state, &args, &mut overlay);
+        route_approval_response(
+            &mut state,
+            &args,
+            &mut overlay,
+            &prompt_tx,
+            &mut prompt_inflight,
+            &mut session_log,
+            "approve",
+        );
+
+        assert!(!prompt_inflight);
+        assert!(state.pending_approval.is_some());
+        assert!(overlay.message.contains("observe-only"));
+    }
+
+    #[test]
+    fn keyboard_wake_key_arms_listening_state() {
+        let args = TuiArgs::default();
+        let mut state = CockpitState::fake_listening();
+        state.events.clear();
+        let mut overlay = UiOverlay::default();
+        let mut session_log = None;
+
+        let _ = args;
+        arm_keyboard_wake(&mut state, &mut overlay, &mut session_log);
+
+        assert!(overlay.message.contains("wake armed"));
+        assert!(state.events.iter().any(|event| {
+            event.kind == EventKind::Listening && event.label.contains("wake: armed keyboard")
+        }));
+    }
+
+    #[test]
+    fn keyboard_wake_reports_configured_hermes_voice_readiness() {
+        let mut state = CockpitState::fake_listening();
+        state.backend = BackendKind::Hermes;
+        state.backend_label = "HERMES".to_string();
+        state.events.clear();
+        let mut overlay = UiOverlay::default();
+        let mut session_log = None;
+        let hermes_config = r#"
+voice:
+  record_key: ctrl+b
+stt:
+  enabled: true
+  provider: groq
+tts:
+  provider: gemini
+"#;
+
+        arm_keyboard_wake_with_backend_voice_config(
+            &mut state,
+            &mut overlay,
+            &mut session_log,
+            Some(hermes_config),
+        );
+
+        assert!(overlay.message.contains("backend voice ready"));
+        assert!(state.events.iter().any(|event| {
+            event.kind == EventKind::Listening && event.label.contains("wake: armed keyboard")
         }));
     }
 
@@ -1243,6 +1846,7 @@ mod tests {
             input_cursor: 6,
             message: String::new(),
             activity_scroll: 0,
+            approval_armed_id: None,
         };
         let backend = TestBackend::new(120, 36);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -1272,6 +1876,7 @@ mod tests {
             input_cursor: 5,
             message: String::new(),
             activity_scroll: 0,
+            approval_armed_id: None,
         };
         let (prompt_tx, _prompt_rx) = mpsc::channel();
         let mut prompt_inflight = false;
@@ -1321,6 +1926,7 @@ mod tests {
             input_cursor: 5,
             message: String::new(),
             activity_scroll: 0,
+            approval_armed_id: None,
         };
         let (prompt_tx, _prompt_rx) = mpsc::channel();
         let mut prompt_inflight = false;
@@ -1390,6 +1996,7 @@ mod tests {
             input_cursor: 12,
             message: String::new(),
             activity_scroll: 0,
+            approval_armed_id: None,
         };
         let (prompt_tx, _prompt_rx) = mpsc::channel();
         let mut prompt_inflight = true;
@@ -1412,6 +2019,96 @@ mod tests {
     }
 
     #[test]
+    fn successful_backend_reply_returns_cockpit_to_listening() {
+        let mut state = CockpitState::fake_listening();
+        state.pending_approval = None;
+        state.events.clear();
+        state.events.push(CockpitEvent::now(
+            EventKind::Processing,
+            "sending: hello backend",
+        ));
+        let mut overlay = UiOverlay::default();
+        let mut session_log = None;
+
+        apply_prompt_result(
+            &mut state,
+            &mut overlay,
+            backend::BackendCommandResult {
+                ok: true,
+                summary: "done".to_string(),
+                audio_path: None,
+            },
+            &mut session_log,
+        );
+        engine::apply_projection(&mut state);
+
+        assert_eq!(state.mode, CockpitMode::Listening);
+        assert!(state.events.iter().any(|event| {
+            event.kind == EventKind::Listening && event.label == "ready: listening for next turn"
+        }));
+    }
+
+    #[test]
+    fn refresh_drops_stale_ready_when_backend_reports_active_state() {
+        let mut state = CockpitState::fake_listening();
+        state.pending_approval = None;
+        state.events.clear();
+        state.events.push(CockpitEvent::now(
+            EventKind::Listening,
+            "ready: listening for next turn",
+        ));
+
+        let mut refreshed = CockpitState::fake_listening();
+        refreshed.pending_approval = None;
+        refreshed.events.clear();
+        refreshed.events.push(CockpitEvent::now(
+            EventKind::ApprovalRequested,
+            "approval requested for shell command",
+        ));
+
+        apply_refreshed_state(&mut state, refreshed);
+        engine::apply_projection(&mut state);
+
+        assert_eq!(state.mode, CockpitMode::ApprovalNeeded);
+        assert!(
+            !state
+                .events
+                .iter()
+                .any(|event| event.label == "ready: listening for next turn")
+        );
+    }
+
+    #[test]
+    fn refresh_drops_stale_ready_when_backend_reports_speaking() {
+        let mut state = CockpitState::fake_listening();
+        state.pending_approval = None;
+        state.events.clear();
+        state.events.push(CockpitEvent::now(
+            EventKind::Listening,
+            "ready: listening for next turn",
+        ));
+
+        let mut refreshed = CockpitState::fake_listening();
+        refreshed.pending_approval = None;
+        refreshed.events.clear();
+        refreshed.events.push(CockpitEvent::now(
+            EventKind::Speaking,
+            "tools.voice_mode: TTS audio playback started",
+        ));
+
+        apply_refreshed_state(&mut state, refreshed);
+        engine::apply_projection(&mut state);
+
+        assert_eq!(state.mode, CockpitMode::Speaking);
+        assert!(
+            !state
+                .events
+                .iter()
+                .any(|event| event.label == "ready: listening for next turn")
+        );
+    }
+
+    #[test]
     fn input_mode_can_scroll_activity_log() {
         let args = TuiArgs::default();
         let mut state = CockpitState::fake_listening();
@@ -1421,6 +2118,7 @@ mod tests {
             input_cursor: 0,
             message: String::new(),
             activity_scroll: 0,
+            approval_armed_id: None,
         };
         let (prompt_tx, _prompt_rx) = mpsc::channel();
         let mut prompt_inflight = false;
