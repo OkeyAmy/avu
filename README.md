@@ -136,12 +136,13 @@ Once inside the cockpit (`avu tui`):
 | `:` | Open input picker |
 | `:` then `c` | Enter **CMD mode** — type a shell command, press Enter to run |
 | `:` then `t` | Enter **Chat mode** — type a message for the backend |
-| `:` then `/` | Enter **Chat mode** with `/` prefilled (backend slash commands) |
+| `:` then `/` | Enter **Slash mode** — raw backend slash commands are sent unchanged |
 | `Enter` | Submit the current input |
 | `Backspace` / `Delete` | Delete last character |
 | `Ctrl+B` | Hand the terminal to Hermes interactive voice/TUI mode |
 | `Esc` | Cancel current input / quit when not typing |
 | `s` | Refresh backend status immediately |
+| `w` | Arm keyboard wake/listening mode for the configured wake phrase |
 | `m` | Show voice command help in the activity log |
 | `i` | Request interrupt (backend routing not yet enabled) |
 | `q` | Quit the cockpit |
@@ -158,13 +159,15 @@ Once inside the cockpit (`avu tui`):
 
 ### Approval controls
 
-When a pending approval is displayed:
+When a structured pending approval is displayed and routing is enabled for that backend:
 
 | Key | Action |
 |-----|--------|
 | `a` | Arm approval intent (for destructive operations) |
 | `A` | Confirm armed approval (requires second confirmation) |
 | `r` | Route rejection via backend |
+
+Live Hermes/OpenClaw log approval events are observe/notify until the backend exposes a structured pending approval source that Avu can bind to a backend, approval ID, and permission posture. Avu will not route approval responses from fixtures or vague log text as live backend authority.
 
 ---
 
@@ -252,9 +255,22 @@ Chat input routes via `openclaw agent --message <text>`. OpenClaw decides tool d
 
 1. Avu reads Hermes voice config from `~/.hermes/config.yaml` — STT provider, TTS provider, record key.
 2. The cockpit shows voice status in the footer bar (e.g., `STT groq · TTS gemini/Kore · key ctrl+b`).
-3. Use Chat mode to send voice commands: `/voice on`, `/tts say hello`, `/stt switch groq`.
-4. When Hermes generates an audio file in response, Avu detects it and starts playback automatically.
-5. For microphone recording, press `Ctrl+B` in Avu. Avu temporarily hands the terminal to Hermes' own interactive voice/TUI mode because Hermes owns raw push-to-talk, microphone capture, silence detection, STT, and spoken replies.
+3. Press `w` to arm Avu's keyboard wake/listening state. The default phrase is `hey avu`, and typed wake-prefixed commands are parsed by Avu's intent layer for safe controls.
+4. Use Slash mode to send raw backend voice commands: `/voice on`, `/voice status`, `/tts say hello`, `/stt switch groq`.
+5. When Hermes generates an audio file in response, Avu detects it and plays it after the backend turn completes.
+6. For real microphone recording, press `Ctrl+B` in Avu. Avu temporarily hands the terminal to Hermes' own interactive voice/TUI mode because Hermes owns raw push-to-talk, microphone capture, silence detection, STT, and spoken replies.
+
+### Confirming real voice pickup
+
+Avu does not fake microphone support. A real voice check must pass through Hermes' voice stack:
+
+1. Install Hermes voice support and system audio dependencies (`hermes-agent[voice]`, PortAudio, ffmpeg, and a working STT/TTS provider).
+2. Run `avu tui --backend hermes` and press `Ctrl+B`.
+3. Inside Hermes voice mode, run `/voice on` if needed.
+4. Press Hermes' configured record key (`voice.record_key`, usually `ctrl+b`), speak, then stop speaking.
+5. Hermes should show live audio levels, auto-stop after silence, transcribe the utterance, run the normal agent/tool pipeline, and speak the reply back.
+
+Avu's role is to expose readiness, route commands, mirror progress/permission events, and return to the cockpit after the backend voice session exits. Native Avu-owned microphone capture remains optional future work so normal users do not need Rust audio dependencies.
 
 ### Troubleshooting
 
