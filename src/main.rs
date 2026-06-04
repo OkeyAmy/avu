@@ -1,16 +1,20 @@
 mod app;
 mod backend;
+pub mod backend_events;
 mod cli;
 mod config;
 mod doctor;
 mod domain;
 mod engine;
+pub mod gateway;
 mod hud;
 mod install;
 mod intent;
 mod runtime;
 mod setup;
 mod tui;
+pub mod voice;
+pub mod voice_activation;
 
 use anyhow::Result;
 use clap::Parser;

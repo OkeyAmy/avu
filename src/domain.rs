@@ -300,4 +300,37 @@ mod runtime_tests {
         let state = CockpitState::from_runtime(snapshot);
         assert_eq!(state.model_label, "claude-local");
     }
+
+    #[test]
+    fn runtime_approval_event_with_command_stays_observe_only() {
+        let mut snapshot = RuntimeSnapshot::missing("hermes");
+        snapshot.backend = BackendKind::Hermes;
+        snapshot.backend_label = "HERMES".to_string();
+        snapshot.reachable = true;
+        snapshot.log_events = vec![CockpitEvent::now(
+            EventKind::ApprovalRequested,
+            "agent: approval requested for rm -rf build-cache",
+        )];
+
+        let state = CockpitState::from_runtime(snapshot);
+
+        assert!(state.pending_approval.is_none());
+        assert_eq!(state.events[0].kind, EventKind::ApprovalRequested);
+    }
+
+    #[test]
+    fn vague_runtime_approval_event_stays_observe_only() {
+        let mut snapshot = RuntimeSnapshot::missing("openclaw");
+        snapshot.backend = BackendKind::OpenClaw;
+        snapshot.backend_label = "OPENCLAW".to_string();
+        snapshot.reachable = true;
+        snapshot.log_events = vec![CockpitEvent::now(
+            EventKind::ApprovalRequested,
+            "approval required for destructive operation",
+        )];
+
+        let state = CockpitState::from_runtime(snapshot);
+
+        assert!(state.pending_approval.is_none());
+    }
 }
