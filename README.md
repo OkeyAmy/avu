@@ -1,5 +1,9 @@
 # Avu
 
+> **Archived project**
+>
+> This project has been archived and is no longer actively maintained. The repository is kept for historical reference only while a new repository is prepared.
+
 **Terminal cockpit for live AI-agent backends.**
 
 Avu is a Ratatui-based terminal UI that connects to [Hermes Agent](https://hermes-agent.nousresearch.com/) or OpenClaw. It surfaces real-time backend state — model, gateway health, voice/STT/TTS configuration, recent activity, approvals, and operator controls — without inventing fake data. The backend owns tools, permissions, memory, sessions, and execution; Avu owns the cockpit UI and routes your input.
