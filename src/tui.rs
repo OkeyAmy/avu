@@ -828,8 +828,19 @@ fn apply_prompt_result(
     } else {
         EventKind::Warning
     };
-    let label = format!("backend: {}", cmd_result.summary);
-    push_operator_event(state, kind, &label, session_log);
+    if cmd_result.events.is_empty() {
+        let label = format!("backend: {}", cmd_result.summary);
+        push_operator_event(state, kind, &label, session_log);
+    } else {
+        for event in &cmd_result.events {
+            push_operator_event(
+                state,
+                event.kind.clone(),
+                &format!("backend: {}", event.label),
+                session_log,
+            );
+        }
+    }
     if cmd_result.ok {
         push_operator_event(
             state,
@@ -914,9 +925,10 @@ fn is_operator_event(label: &str) -> bool {
         || label.starts_with("Avu session ")
 }
 
-fn keep_recent_state_events(state: &mut CockpitState, limit: usize) {
-    if state.events.len() > limit {
-        let drop_count = state.events.len() - limit;
+fn keep_recent_state_events(state: &mut CockpitState, visible_limit: usize) {
+    let retention_limit = visible_limit.max(200);
+    if state.events.len() > retention_limit {
+        let drop_count = state.events.len() - retention_limit;
         state.events.drain(0..drop_count);
     }
 }
@@ -2037,6 +2049,7 @@ tts:
                 ok: true,
                 summary: "done".to_string(),
                 audio_path: None,
+                events: Vec::new(),
             },
             &mut session_log,
         );
@@ -2046,6 +2059,71 @@ tts:
         assert!(state.events.iter().any(|event| {
             event.kind == EventKind::Listening && event.label == "ready: listening for next turn"
         }));
+    }
+
+    #[test]
+    fn backend_reply_preserves_full_progress_events() {
+        let mut state = CockpitState::fake_listening();
+        state.pending_approval = None;
+        state.events.clear();
+        let mut overlay = UiOverlay::default();
+        let mut session_log = None;
+
+        apply_prompt_result(
+            &mut state,
+            &mut overlay,
+            backend::BackendCommandResult {
+                ok: true,
+                summary: "session avu-tui running".to_string(),
+                audio_path: None,
+                events: vec![
+                    backend::BackendCommandEvent {
+                        kind: EventKind::Processing,
+                        label: "session avu-tui running".to_string(),
+                    },
+                    backend::BackendCommandEvent {
+                        kind: EventKind::ToolStart,
+                        label: "tool dispatch start: search.files with full generated command text"
+                            .to_string(),
+                    },
+                    backend::BackendCommandEvent {
+                        kind: EventKind::ResponseStream,
+                        label: "final response ready: full final answer text".to_string(),
+                    },
+                ],
+            },
+            &mut session_log,
+        );
+
+        assert!(state.events.iter().any(|event| {
+            event.kind == EventKind::ToolStart
+                && event
+                    .label
+                    .contains("tool dispatch start: search.files with full generated command text")
+        }));
+        assert!(state.events.iter().any(|event| {
+            event.kind == EventKind::ResponseStream
+                && event
+                    .label
+                    .contains("final response ready: full final answer text")
+        }));
+        assert!(overlay.message.contains("backend replied"));
+    }
+
+    #[test]
+    fn state_event_retention_keeps_full_activity_history_beyond_visible_rows() {
+        let mut state = CockpitState::fake_listening();
+        state.events = (0..40)
+            .map(|index| CockpitEvent::now(EventKind::Processing, format!("event-{index}")))
+            .collect();
+
+        keep_recent_state_events(&mut state, 12);
+
+        assert_eq!(state.events.len(), 40);
+        assert_eq!(
+            state.events.first().map(|event| event.label.as_str()),
+            Some("event-0")
+        );
     }
 
     #[test]

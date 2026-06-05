@@ -1,7 +1,7 @@
 use crate::{
     backend_events::BackendTurnRequest,
     cli::BackendChoice,
-    domain::{CapabilitySnapshot, CockpitState},
+    domain::{CapabilitySnapshot, CockpitState, EventKind},
     runtime,
 };
 use anyhow::{Context, Result};
@@ -30,6 +30,13 @@ pub struct BackendCommandResult {
     pub ok: bool,
     pub summary: String,
     pub audio_path: Option<PathBuf>,
+    pub events: Vec<BackendCommandEvent>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BackendCommandEvent {
+    pub kind: EventKind,
+    pub label: String,
 }
 
 impl BackendCommandResult {
@@ -38,6 +45,7 @@ impl BackendCommandResult {
             ok: true,
             summary: summary.into(),
             audio_path: None,
+            events: Vec::new(),
         }
     }
 
@@ -46,11 +54,17 @@ impl BackendCommandResult {
             ok: false,
             summary: summary.into(),
             audio_path: None,
+            events: Vec::new(),
         }
     }
 
     fn with_audio(mut self, audio_path: Option<PathBuf>) -> Self {
         self.audio_path = audio_path;
+        self
+    }
+
+    fn with_events(mut self, events: Vec<BackendCommandEvent>) -> Self {
+        self.events = events;
         self
     }
 }
@@ -205,13 +219,30 @@ fn run_backend_prompt(command: &str, prompt: &str) -> BackendCommandResult {
     let before_audio = latest_backend_audio(command);
 
     let args = backend_prompt_args(command, prompt);
-    let result = run_command_prompt(command, &args, before_audio.as_ref());
+    let mut result = run_command_prompt(command, &args, before_audio.as_ref());
 
     let after_audio = latest_backend_audio(command);
-    let new_audio = result
+    let mut new_audio = result
         .audio_path
         .clone()
         .or_else(|| newer_audio(before_audio.as_ref(), after_audio.as_ref()).cloned());
+
+    if should_request_final_voice(command, prompt, &result, new_audio.as_ref()) {
+        result.events.push(BackendCommandEvent {
+            kind: EventKind::Speaking,
+            label: "final voice output requested via Hermes TTS".to_string(),
+        });
+        let tts_before_audio = latest_backend_audio(command);
+        let tts_prompt = tts_prompt_for_text(&spoken_fallback_text(&result));
+        let tts_args = backend_prompt_args(command, &tts_prompt);
+        let tts_result = run_command_prompt(command, &tts_args, tts_before_audio.as_ref());
+        result.events.extend(tts_result.events);
+        let tts_after_audio = latest_backend_audio(command);
+        new_audio = tts_result
+            .audio_path
+            .or_else(|| newer_audio(tts_before_audio.as_ref(), tts_after_audio.as_ref()).cloned());
+    }
+
     let played = new_audio.as_ref().and_then(|path| play_audio(path));
     let result = result.with_audio(new_audio.clone());
 
@@ -230,12 +261,54 @@ fn run_backend_prompt(command: &str, prompt: &str) -> BackendCommandResult {
     }
 }
 
+fn should_request_final_voice(
+    command: &str,
+    prompt: &str,
+    result: &BackendCommandResult,
+    audio_path: Option<&PathBuf>,
+) -> bool {
+    command == "hermes" && result.ok && audio_path.is_none() && !is_backend_control_prompt(prompt)
+}
+
+fn is_backend_control_prompt(prompt: &str) -> bool {
+    prompt.trim_start().starts_with('/')
+}
+
+fn spoken_fallback_text(result: &BackendCommandResult) -> String {
+    result
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.kind == EventKind::ResponseStream)
+        .map(|event| event.label.as_str())
+        .unwrap_or(&result.summary)
+        .to_string()
+}
+
+fn tts_prompt_for_text(text: &str) -> String {
+    let spoken = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("/tts say {}", spoken)
+}
+
 fn backend_prompt_args<'a>(command: &str, prompt: &'a str) -> Vec<&'a str> {
     match command {
-        "hermes" => vec!["--continue", "avu-tui", "--oneshot", prompt],
+        "hermes" => vec!["--continue", hermes_session_id(), "--oneshot", prompt],
         "openclaw" => vec!["agent", "--message", prompt],
         _ => vec![prompt],
     }
+}
+
+fn hermes_session_id() -> &'static str {
+    "avu-tui"
+}
+
+fn hermes_voice_tui_args() -> [&'static str; 2] {
+    ["--continue", "--tui"]
 }
 
 pub fn run_shell_command(command: &str) -> BackendCommandResult {
@@ -268,7 +341,7 @@ pub fn run_shell_command(command: &str) -> BackendCommandResult {
 
 pub fn run_voice_session(choice: BackendChoice) -> BackendCommandResult {
     match adapter_for(choice).label() {
-        "hermes" => run_interactive_backend("hermes", &["--continue", "avu-tui", "--tui"]),
+        "hermes" => run_interactive_backend("hermes", &hermes_voice_tui_args()),
         "openclaw" => {
             BackendCommandResult::failed("OpenClaw voice handoff is not available through Avu yet")
         }
@@ -580,6 +653,7 @@ fn summarize_output(output: std::process::Output) -> BackendCommandResult {
         .filter(|line| !line.is_empty())
         .collect();
     let audio_path = lines.iter().find_map(|line| media_path_from_line(line));
+    let events = backend_output_events(&lines, output.status.success());
     let summary = lines
         .iter()
         .copied()
@@ -593,10 +667,35 @@ fn summarize_output(output: std::process::Output) -> BackendCommandResult {
         .to_string();
 
     if output.status.success() {
-        BackendCommandResult::ok(summary).with_audio(audio_path)
+        BackendCommandResult::ok(summary)
+            .with_audio(audio_path)
+            .with_events(events)
     } else {
-        BackendCommandResult::failed(summary).with_audio(audio_path)
+        BackendCommandResult::failed(summary)
+            .with_audio(audio_path)
+            .with_events(events)
     }
+}
+
+fn backend_output_events(lines: &[&str], ok: bool) -> Vec<BackendCommandEvent> {
+    lines
+        .iter()
+        .copied()
+        .filter(|line| !line.starts_with("MEDIA:") && *line != "[[audio_as_voice]]")
+        .map(|line| BackendCommandEvent {
+            kind: backend_output_kind(line, ok),
+            label: line.to_string(),
+        })
+        .collect()
+}
+
+fn backend_output_kind(line: &str, ok: bool) -> EventKind {
+    if !ok {
+        return EventKind::Warning;
+    }
+    crate::backend_events::classify_backend_event(line)
+        .map(|class| crate::backend_events::event_kind_for_class(&class))
+        .unwrap_or(EventKind::ResponseStream)
 }
 
 fn media_path_from_line(line: &str) -> Option<PathBuf> {
@@ -651,6 +750,102 @@ mod tests {
     }
 
     #[test]
+    fn hermes_prompt_uses_stable_avu_session_identity() {
+        assert_eq!(
+            backend_prompt_args("hermes", "what was my last message?"),
+            vec![
+                "--continue",
+                "avu-tui",
+                "--oneshot",
+                "what was my last message?"
+            ]
+        );
+    }
+
+    #[test]
+    fn hermes_voice_handoff_uses_latest_session_tui_args() {
+        assert_eq!(hermes_voice_tui_args(), ["--continue", "--tui"]);
+    }
+
+    #[test]
+    fn tts_prompt_for_summary_speaks_final_answer_as_one_utterance() {
+        assert_eq!(
+            tts_prompt_for_text("First line\n\nSecond line"),
+            "/tts say First line Second line"
+        );
+    }
+
+    #[test]
+    fn spoken_fallback_prefers_last_response_event_over_progress_summary() {
+        let result = BackendCommandResult {
+            ok: true,
+            summary: "session avu-tui running".to_string(),
+            audio_path: None,
+            events: vec![
+                BackendCommandEvent {
+                    kind: EventKind::Processing,
+                    label: "session avu-tui running".to_string(),
+                },
+                BackendCommandEvent {
+                    kind: EventKind::ResponseStream,
+                    label: "intermediate response chunk".to_string(),
+                },
+                BackendCommandEvent {
+                    kind: EventKind::ResponseStream,
+                    label: "final answer that should be spoken".to_string(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            spoken_fallback_text(&result),
+            "final answer that should be spoken"
+        );
+    }
+
+    #[test]
+    fn final_voice_fallback_skips_slash_control_prompts() {
+        let result = BackendCommandResult::ok("voice command acknowledged");
+
+        assert!(!should_request_final_voice(
+            "hermes",
+            "/tts say hello",
+            &result,
+            None
+        ));
+        assert!(!should_request_final_voice(
+            "hermes",
+            "   /status",
+            &result,
+            None
+        ));
+    }
+
+    #[test]
+    fn final_voice_fallback_runs_for_normal_hermes_chat_without_audio() {
+        let result = BackendCommandResult::ok("final answer");
+
+        assert!(should_request_final_voice(
+            "hermes",
+            "tell me the plan",
+            &result,
+            None
+        ));
+        assert!(!should_request_final_voice(
+            "openclaw",
+            "tell me the plan",
+            &result,
+            None
+        ));
+        assert!(!should_request_final_voice(
+            "hermes",
+            "tell me the plan",
+            &result,
+            Some(&PathBuf::from("/tmp/audio.mp3"))
+        ));
+    }
+
+    #[test]
     fn missing_backend_rejects_prompt_routing() {
         let result = MissingBackend.route_prompt("/voice");
         assert!(!result.ok);
@@ -681,6 +876,30 @@ mod tests {
         assert!(result.ok);
         assert_eq!(result.summary, "backend generated audio");
         assert_eq!(result.audio_path, Some(PathBuf::from("/tmp/avu-voice.ogg")));
+    }
+
+    #[test]
+    fn summarize_output_preserves_each_backend_progress_line_as_event() {
+        let output = std::process::Output {
+            status: success_status(),
+            stdout: b"session avu-tui running\ntool dispatch start: search.files\nfinal response ready: done\n".to_vec(),
+            stderr: b"warning: slow tool\n".to_vec(),
+        };
+
+        let result = summarize_output(output);
+
+        assert!(result.ok);
+        assert_eq!(result.summary, "session avu-tui running");
+        assert_eq!(result.events.len(), 4);
+        assert!(result.events.iter().any(|event| {
+            event.kind == EventKind::ToolStart && event.label == "tool dispatch start: search.files"
+        }));
+        assert!(result.events.iter().any(|event| {
+            event.kind == EventKind::ResponseStream && event.label == "final response ready: done"
+        }));
+        assert!(result.events.iter().any(|event| {
+            event.kind == EventKind::Warning && event.label == "warning: slow tool"
+        }));
     }
 
     #[test]
