@@ -2,7 +2,7 @@
 
 > **Archived project**
 >
-> This project has been archived and is no longer actively maintained. The repository is kept for historical reference only while a new repository is prepared.
+> This project has been archived and is no longer actively maintained. The repository may be revived if there is clear demand from heavy users of Hermes or OpenClaw. It would also be great to receive approval or support from the Hermes team itself.
 
 **Terminal cockpit for live AI-agent backends.**
 
